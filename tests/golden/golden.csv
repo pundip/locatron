@@ -1,0 +1,31 @@
+input,expected_granularity,expected_country,expected_admin1,expected_locality,note
+Greater Melbourne,city,AUS,VIC,,qualifier stripping
+Sydney Australia,city,AUS,NSW,,explicit country
+New York,city,USA,New York,,population tiebreak vs other New Yorks
+Las Vegas,city,USA,Nevada,,admin1 from Cities.admin_name
+Delhi,city,IND,Delhi,,must beat Delhi California on population
+Melbourne,city,AUS,VIC,,must beat Melbourne Florida on population
+Perth,city,AUS,WA,,must beat Perth Scotland
+Springfield,city,USA,,,ambiguous within one country, expect low confidence
+65 clifton park drive 3201 carrum downs,address,AUS,VIC,CARRUM DOWNS,postcode before locality
+65 Clifton Park Dr Carrum Downs VIC 3201,address,AUS,VIC,CARRUM DOWNS,conventional ordering
+5/12 Smith Street Fitzroy VIC 3065,unit,AUS,VIC,FITZROY,unit prefix form
+Unit 5 12 Smith Street Fitzroy 3065,unit,AUS,VIC,FITZROY,spelled unit form
+14-40 Wills Street Melbourne VIC 3000,address,AUS,VIC,MELBOURNE,number range
+Clifton Park Drive Carrum Downs,street,AUS,VIC,CARRUM DOWNS,no street number, falls back to street
+Carrum Downs VIC,locality,AUS,VIC,CARRUM DOWNS,locality only
+3201,postcode,AUS,VIC,,bare postcode
+PO Box 45 World Square NSW 2002,postcode,AUS,NSW,,postal only, no G-NAF match
+Ryde NSW 2112,locality,AUS,NSW,RYDE,the street_key collision locality
+Hamilton Crescent Ryde NSW 2112,street,AUS,NSW,RYDE,exercises the merged street variant
+St Kilda East VIC,locality,AUS,VIC,ST KILDA EAST,saint abbreviation
+Ku-ring-gai NSW,locality,AUS,NSW,,hyphenated locality
+Victoria Australia,admin1,AUS,VIC,,state only
+VIC,admin1,AUS,VIC,,state code
+Australia,country,AUS,,,country only
+Remote / Work from home,unresolved,,,,must not raise
+,unresolved,,,,empty string must not raise
+asdfghjkl,unresolved,,,,garbage must not raise
+London,city,GBR,,,population tiebreak vs London Ontario
+Zurich,city,CHE,,,transliteration of Zurich
+Sao Paulo,city,BRA,,,transliteration

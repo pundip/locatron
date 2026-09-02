@@ -1,0 +1,21 @@
+[Unit]
+Description=Locatron gazetteer and export rebuild
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=locatron
+Group=locatron
+WorkingDirectory=/opt/locatron/app
+EnvironmentFile=/opt/locatron/.env
+# Builds the local SQLite street gazetteer and Parquet export snapshots,
+# writes to a temp path, then swaps atomically so readers never see a
+# half-built file.
+ExecStart=/opt/locatron/venv/bin/python -m locatron.build.refresh
+TimeoutStartSec=7200
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/locatron

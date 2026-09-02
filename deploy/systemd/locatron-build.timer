@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Locatron rebuild
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target

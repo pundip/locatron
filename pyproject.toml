@@ -1,0 +1,41 @@
+[project]
+name = "locatron"
+version = "0.1.0"
+description = "Location resolution API, Australian-focused"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "gunicorn>=23.0",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1",
+    "redis>=5.2",
+    "rapidfuzz>=3.10",
+    "anyascii>=0.3",
+    "cachetools>=5.5",
+    "typer>=0.15",
+    "structlog>=24.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "pytest-cov>=6.0", "ruff>=0.8", "mypy>=1.13"]
+export = ["pyarrow>=18.0"]
+
+[project.scripts]
+locatron = "locatron.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

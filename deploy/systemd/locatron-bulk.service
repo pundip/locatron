@@ -1,0 +1,37 @@
+[Unit]
+Description=Locatron bulk export and batch API
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=locatron
+Group=locatron
+WorkingDirectory=/opt/locatron/app
+EnvironmentFile=/opt/locatron/.env
+# Fewer workers, much longer timeout. Separate process so a large export
+# cannot starve interactive traffic.
+ExecStart=/opt/locatron/venv/bin/gunicorn locatron.bulk.app:app \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --workers 2 \
+    --bind 127.0.0.1:8081 \
+    --timeout 3600 \
+    --graceful-timeout 60 \
+    --access-logfile - \
+    --error-logfile -
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/locatron
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

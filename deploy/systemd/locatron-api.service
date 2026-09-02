@@ -1,0 +1,40 @@
+[Unit]
+Description=Locatron interactive resolve API
+Documentation=https://github.com/YOU/locatron
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=locatron
+Group=locatron
+WorkingDirectory=/opt/locatron/app
+EnvironmentFile=/opt/locatron/.env
+ExecStart=/opt/locatron/venv/bin/gunicorn locatron.api.app:app \
+    --worker-class uvicorn.workers.UvicornWorker \
+    --workers 4 \
+    --bind 127.0.0.1:8080 \
+    --timeout 30 \
+    --graceful-timeout 30 \
+    --keep-alive 5 \
+    --max-requests 10000 \
+    --max-requests-jitter 1000 \
+    --access-logfile - \
+    --error-logfile -
+ExecReload=/bin/kill -s HUP $MAINPID
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/locatron
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
