@@ -81,7 +81,9 @@ def check() -> None:
 
 @app.command()
 def schema(
-    tables: list[str] = typer.Argument(None, help="Table names. Omit for all known tables."),
+    tables: list[str] = typer.Argument(  # noqa: B008 - typer reads the default
+        None, help="Table names. Omit for all known tables."
+    ),
     ddl: bool = typer.Option(False, "--ddl", help="Full SHOW CREATE TABLE instead of a summary."),
 ) -> None:
     """Show the structure of the reference and derived tables.
