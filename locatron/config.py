@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     fuzzy_locality_min: int = Field(88, ge=0, le=100)
     fuzzy_street_min: int = Field(85, ge=0, le=100)
     fuzzy_city_min: int = Field(90, ge=0, le=100)
+    # Per-token similarity floor. Jaro-Winkler weights the start of a string,
+    # so every 'MELBOURNE <anything>' scores ~90 against both 'MELBOURNE' and
+    # 'MELBOURNE AIRPORT'. A whole-string score cannot tell those apart; a
+    # per-token one can. See _explains_every_token.
+    fuzzy_token_min: int = Field(80, ge=0, le=100)
 
     # --- scoring -------------------------------------------------------------
     # Base score by how the name was matched. Ordered: an exact canonical hit
@@ -65,16 +70,27 @@ class Settings(BaseSettings):
     # A bare country or state with no populated place named in the input can
     # never be as good as a city hit, so it starts lower.
     score_country_only: float = Field(0.70, ge=0.0, le=1.0)
+    # A country_bucket value that implies a country without naming one
+    # ('The land down under'). Weaker than a stated country.
+    score_country_implied: float = Field(0.62, ge=0.0, le=1.0)
     score_admin1_only: float = Field(0.74, ge=0.0, le=1.0)
 
     # Ambiguity. Dominance is the winner's share of size (population for world
     # cities, address_count for AU localities) against its nearest rival:
     #   dominance = winner / (winner + runner_up)
     # 0.5 means a dead heat, 1.0 means the runner-up is negligible. The penalty
-    # scales linearly from full at a dead heat to nothing at total dominance.
-    # This is what keeps Springfield honest without special-casing it.
+    # is full at a dead heat and tapers to nothing at score_dominance_clear.
+    # This is what keeps Springfield honest without special-casing it: six US
+    # Springfields sit near 0.60 and land below low_confidence_threshold, while
+    # Delhi IN at 0.9997 and Melbourne AU at 0.983 are clear outright.
     score_ambiguity_penalty_max: float = Field(0.34, ge=0.0, le=1.0)
-    score_dominance_floor: float = Field(0.55, ge=0.5, le=1.0)
+    score_dominance_clear: float = Field(0.98, ge=0.5, le=1.0)
+
+    # An Australian locality named with no state and no postcode is weaker
+    # evidence than a world city of the same name: the locality gazetteer is
+    # 18.5k mostly-obscure suburbs, Cities is populated places. Applied only
+    # when the input carries no Australian signal at all.
+    score_locality_unqualified_penalty: float = Field(0.08, ge=0.0, le=1.0)
 
     # Runner-ups within this much of the winner are emitted as candidates.
     candidate_margin: float = Field(0.15, ge=0.0, le=1.0)
@@ -83,6 +99,12 @@ class Settings(BaseSettings):
     # Below this, a resolved answer is still returned but flagged low-confidence
     # so the caller (and locatron_unresolved) can act on it.
     low_confidence_threshold: float = Field(0.55, ge=0.0, le=1.0)
+
+    # Ceiling for a gazetteer-level answer. Exact name plus a state plus a
+    # postcode sums past 1.0 and saturates, which reports a locality lookup as
+    # certainty. Above this is reserved for an exact G-NAF address match, which
+    # identifies one property rather than a named area.
+    score_max: float = Field(0.98, ge=0.0, le=1.0)
 
     @property
     def mysql_url(self) -> str:

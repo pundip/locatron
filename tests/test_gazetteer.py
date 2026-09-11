@@ -152,7 +152,9 @@ def test_countries_prefers_iso_name_over_cities_spelling() -> None:
     ],
 )
 def test_country_variants_resolve(variant: str, alpha3: str) -> None:
-    row = load_countries().lookup(normalize(variant))
+    g = load_countries()
+    key = normalize(variant)
+    row = g.lookup_token(key) or g.lookup_trailing_code(key)
     assert row is not None, f"{variant!r} did not resolve"
     assert row.alpha3 == alpha3
 
@@ -161,7 +163,47 @@ def test_country_variants_resolve(variant: str, alpha3: str) -> None:
 def test_country_bucket_never_shadows_an_iso_code() -> None:
     """Every country_bucket variant points at a country the ISO table knows."""
     g = load_countries()
-    assert all(a3 in g.by_alpha3 for a3 in g.variants.values())
+    for mapping in (g.tokens, g.code_tokens, g.hints):
+        assert all(a3 in g.by_alpha3 for a3 in mapping.values())
+
+
+@needs_db
+@pytest.mark.parametrize("value", ["melbourne", "Bangkok", "Queensland", "Scotland"])
+def test_bucket_values_that_are_places_are_hints_at_most(value: str) -> None:
+    """country_bucket maps loose location strings, not just country names.
+
+    'melbourne' -> AUS is correct for its own purpose and ruinous for peeling:
+    it eats the city name and answers a bare country.
+    """
+    g = load_countries()
+    key = normalize(value)
+    assert g.lookup_hint(key) is not None, f"{value!r} should still imply a country"
+    if value != "Scotland":
+        assert g.lookup_token(key) is None, f"{value!r} must not be peelable"
+
+
+@needs_db
+@pytest.mark.parametrize("code", ["ST", "MT", "IN", "LA", "PA", "AND", "ARE", "CAN"])
+def test_bare_iso_codes_are_positional(code: str) -> None:
+    """'ST KILDA EAST' must not lose its first token to Sao Tome.
+
+    normalize() even manufactures AND, by expanding '&'.
+    """
+    g = load_countries()
+    assert g.lookup_token(code) is None, f"{code} must not peel mid-string"
+    assert g.lookup_trailing_code(code) is not None, f"{code} should work trailing"
+
+
+@needs_db
+def test_state_tokens_never_read_as_countries() -> None:
+    """'Queensland' is AUS in country_bucket and QLD in aus_state_bucket.
+
+    The state reading wins: it implies the country anyway, and says more.
+    """
+    g = load_countries()
+    for key in load_au().state_tokens:
+        assert g.lookup_token(key) is None, f"{key!r} should read as a state"
+        assert g.lookup_trailing_code(key) is None
 
 
 @needs_db
