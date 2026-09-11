@@ -10,12 +10,12 @@ back as HTTP 200 with granularity=UNRESOLVED and confidence=0.0.
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class Granularity(str, Enum):
+class Granularity(StrEnum):
     """Ordered from most to least specific."""
 
     UNIT = "unit"
@@ -37,7 +37,7 @@ def at_least(got: Granularity, want: Granularity) -> bool:
     return _ORDER.index(got) <= _ORDER.index(want)
 
 
-class MatchMethod(str, Enum):
+class MatchMethod(StrEnum):
     CACHE = "cache"
     GNAF_EXACT = "gnaf_exact"
     GNAF_STREET_CENTROID = "gnaf_street_centroid"
@@ -53,7 +53,7 @@ class MatchMethod(str, Enum):
     NONE = "none"
 
 
-class GeoSource(str, Enum):
+class GeoSource(StrEnum):
     GNAF_PROPERTY_CENTROID = "gnaf_property_centroid"
     GNAF_STREET_CENTROID = "gnaf_street_centroid"
     LOCALITY_CENTROID = "locality_centroid"
@@ -101,7 +101,10 @@ class AuAddress(BaseModel):
     alias_principal: str | None = None
     primary_secondary: str | None = None
     formatted: str | None = Field(
-        None, description="Single-line canonical form, e.g. '65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201'"
+        None,
+        description=(
+            "Single-line canonical form, e.g. '65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201'"
+        ),
     )
 
 
