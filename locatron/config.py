@@ -49,6 +49,41 @@ class Settings(BaseSettings):
     fuzzy_street_min: int = Field(85, ge=0, le=100)
     fuzzy_city_min: int = Field(90, ge=0, le=100)
 
+    # --- scoring -------------------------------------------------------------
+    # Base score by how the name was matched. Ordered: an exact canonical hit
+    # should always outrank the same name reached through an alias or fuzz.
+    score_exact: float = Field(0.80, ge=0.0, le=1.0)
+    score_alias: float = Field(0.72, ge=0.0, le=1.0)
+    score_qualifier_stripped: float = Field(0.74, ge=0.0, le=1.0)
+    score_fuzzy_max: float = Field(0.62, ge=0.0, le=1.0)
+
+    # Evidence stated in the input itself, added on top of the base score.
+    score_explicit_country_bonus: float = Field(0.12, ge=0.0, le=1.0)
+    score_explicit_admin1_bonus: float = Field(0.10, ge=0.0, le=1.0)
+    score_postcode_bonus: float = Field(0.10, ge=0.0, le=1.0)
+
+    # A bare country or state with no populated place named in the input can
+    # never be as good as a city hit, so it starts lower.
+    score_country_only: float = Field(0.70, ge=0.0, le=1.0)
+    score_admin1_only: float = Field(0.74, ge=0.0, le=1.0)
+
+    # Ambiguity. Dominance is the winner's share of size (population for world
+    # cities, address_count for AU localities) against its nearest rival:
+    #   dominance = winner / (winner + runner_up)
+    # 0.5 means a dead heat, 1.0 means the runner-up is negligible. The penalty
+    # scales linearly from full at a dead heat to nothing at total dominance.
+    # This is what keeps Springfield honest without special-casing it.
+    score_ambiguity_penalty_max: float = Field(0.34, ge=0.0, le=1.0)
+    score_dominance_floor: float = Field(0.55, ge=0.5, le=1.0)
+
+    # Runner-ups within this much of the winner are emitted as candidates.
+    candidate_margin: float = Field(0.15, ge=0.0, le=1.0)
+    candidate_max: int = Field(8, ge=0, le=50)
+
+    # Below this, a resolved answer is still returned but flagged low-confidence
+    # so the caller (and locatron_unresolved) can act on it.
+    low_confidence_threshold: float = Field(0.55, ge=0.0, le=1.0)
+
     @property
     def mysql_url(self) -> str:
         from urllib.parse import quote_plus
