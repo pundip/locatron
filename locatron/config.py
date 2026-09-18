@@ -1,10 +1,11 @@
 """Settings, loaded from environment or .env.
 
-The .env file is looked up in several places rather than relative to the
-working directory, because the checkout and the env file do not sit together
-on the container (/opt/locatron/app vs /opt/locatron/.env). A cwd-relative
-lookup that finds nothing falls back to every default silently, which shows up
-as a MySQL "Connection refused" against 127.0.0.1 rather than a config error.
+The .env file is looked up in fixed places, never relative to the working
+directory, because the checkout and the env file do not sit together on the
+container (/opt/locatron/app vs /opt/locatron/.env). A cwd-relative lookup that
+finds nothing falls back to every default silently, which shows up as a MySQL
+"Connection refused" against 127.0.0.1 rather than a config error. The lookup
+runs when Settings is constructed, not at import, so it cannot break an import.
 
 Scoring weights and fuzzy thresholds live here deliberately, so they can be
 tuned on the box without a redeploy.
@@ -15,6 +16,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,21 +30,31 @@ ENV_FILE_OVERRIDE_VAR = "LOCATRON_ENV_FILE"
 def env_files() -> list[Path]:
     """Existing .env files, lowest precedence first.
 
-    Order: repo root, current working directory, /opt/locatron/.env, then
-    $LOCATRON_ENV_FILE if set. pydantic-settings applies later files over
-    earlier ones, and real environment variables override all of them.
+    Order: repo root, /opt/locatron/.env, then $LOCATRON_ENV_FILE if set.
+    pydantic-settings applies later files over earlier ones, and real
+    environment variables override all of them.
+
+    The working directory is deliberately not a candidate: it made behaviour
+    depend on where the caller was standing, and a cwd of /root as the
+    locatron user hit a PermissionError on /root/.env.
     """
-    candidates = [REPO_ROOT / ".env", Path.cwd() / ".env", SYSTEM_ENV_FILE]
+    candidates = [REPO_ROOT / ".env", SYSTEM_ENV_FILE]
     override = os.environ.get(ENV_FILE_OVERRIDE_VAR)
     if override:
         candidates.append(Path(override))
 
     found: list[Path] = []
     for c in candidates:
-        if not c.is_file():
+        # is_file() raises PermissionError when a parent directory cannot be
+        # searched. Any OSError means the candidate is unusable, not fatal.
+        try:
+            if not c.is_file():
+                continue
+            c = c.resolve()
+        except OSError:
             continue
-        c = c.resolve()
-        # cwd is usually the repo root. Keep the later (higher-precedence) slot.
+        # The override may name a file already listed. Keep the later
+        # (higher-precedence) slot.
         if c in found:
             found.remove(c)
         found.append(c)
@@ -52,7 +64,6 @@ def env_files() -> list[Path]:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="LOCATRON_",
-        env_file=env_files(),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -143,6 +154,12 @@ class Settings(BaseSettings):
     # identifies one property rather than a named area.
     score_max: float = Field(0.98, ge=0.0, le=1.0)
 
+    def __init__(self, **values: Any) -> None:
+        # Resolve env files at construction rather than in model_config, which
+        # would evaluate them once at import. An explicit _env_file still wins.
+        values.setdefault("_env_file", env_files())
+        super().__init__(**values)
+
     @property
     def mysql_url(self) -> str:
         from urllib.parse import quote_plus
@@ -157,6 +174,4 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    # Re-evaluated here rather than relying on the import-time list in
-    # model_config, so the lookup reflects the cwd and environment at first use.
-    return Settings(_env_file=env_files())
+    return Settings()

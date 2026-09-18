@@ -6,6 +6,8 @@ default, and mysql_host=127.0.0.1 looks like a network problem.
 
 from __future__ import annotations
 
+import os
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -72,3 +74,45 @@ def test_no_env_file_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
 
     assert config.env_files() == []
     assert config.get_settings().mysql_host == "127.0.0.1"
+
+
+def test_cwd_env_is_not_a_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_env(tmp_path / ".env", "cwd-host")
+    monkeypatch.chdir(tmp_path)
+
+    assert config.env_files() == []
+    assert config.get_settings().mysql_host == "127.0.0.1"
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="needs POSIX permissions, and root ignores permission bits",
+)
+def test_unreadable_candidate_dir_is_skipped(
+    isolated: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The container case: /root/.env from a non-root user. Stat of a file
+    # inside a mode-000 directory raises PermissionError from is_file().
+    env = _write_env(isolated / ".env", "repo-host")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    monkeypatch.setattr(config, "SYSTEM_ENV_FILE", locked / ".env")
+    monkeypatch.setenv(config.ENV_FILE_OVERRIDE_VAR, str(locked / "override.env"))
+    locked.chmod(0)
+    try:
+        assert config.env_files() == [env.resolve()]
+        assert config.get_settings().mysql_host == "repo-host"
+    finally:
+        locked.chmod(stat.S_IRWXU)
+
+
+def test_oserror_from_candidate_is_skipped(isolated: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Portable version of the above, so Windows runs still cover the handling.
+    _write_env(isolated / ".env", "repo-host")
+
+    def denied(self: Path) -> bool:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "is_file", denied)
+
+    assert config.env_files() == []
