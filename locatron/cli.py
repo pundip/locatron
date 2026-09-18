@@ -26,7 +26,7 @@ from pathlib import Path
 import typer
 from sqlalchemy import text
 
-from locatron.config import get_settings
+from locatron.config import env_files, get_settings
 from locatron.db import mysql
 from locatron.normalize import NORM_VERSION, normalize, strip_qualifiers
 from locatron.schemas import ResolveResponse
@@ -55,6 +55,16 @@ def check() -> None:
     """Verify config and database connectivity."""
     s = get_settings()
     typer.echo(f"MySQL   {s.mysql_user}@{s.mysql_host}:{s.mysql_port}/{s.mysql_database}")
+    files = env_files()
+    if files:
+        # Listed lowest precedence first; later files override earlier ones.
+        for i, f in enumerate(files):
+            typer.echo(f"{'Env' if i == 0 else '':<8}{f}")
+    else:
+        typer.secho(
+            "Env     NO .env FILE FOUND - using environment variables and defaults only",
+            fg=typer.colors.YELLOW,
+        )
     typer.echo(f"Redis   {s.redis_url}")
     typer.echo(f"Norm    v{NORM_VERSION}")
     typer.echo("")
