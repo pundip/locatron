@@ -19,7 +19,6 @@ ExecStart=/opt/locatron/venv/bin/gunicorn locatron.api.app:app \
     --keep-alive 5 \
     --max-requests 10000 \
     --max-requests-jitter 1000 \
-    --access-logfile - \
     --error-logfile -
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always
