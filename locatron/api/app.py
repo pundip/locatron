@@ -21,6 +21,7 @@ import sys
 import time
 from importlib.metadata import PackageNotFoundError, version
 from typing import Annotated, Any
+from urllib.parse import urlsplit, urlunsplit
 
 import structlog
 from fastapi import FastAPI, Query, Request
@@ -70,6 +71,64 @@ try:
     __version__ = version("locatron")
 except PackageNotFoundError:
     __version__ = "0.0.0"
+
+
+def prefix_location(location: str, root_path: str, host: str) -> str:
+    """Put `root_path` back on a redirect target the app generated.
+
+    Starlette builds its slash redirects from the path it sees, which nginx
+    has already stripped the /locatron prefix from, so the Location header
+    comes out as /v1/resolve and 404s at the edge.
+
+    Only same-host, absolute-path targets are touched. A redirect to another
+    host belongs to whoever wrote it, and a relative one already resolves
+    against the request URL.
+    """
+    if not root_path or not location:
+        return location
+
+    parts = urlsplit(location)
+    if parts.netloc and parts.netloc != host:
+        return location
+    if not parts.path.startswith("/"):
+        return location
+    if parts.path == root_path or parts.path.startswith(f"{root_path}/"):
+        return location
+
+    return urlunsplit(parts._replace(path=root_path + parts.path))
+
+
+class RootPathRedirectMiddleware:
+    """Rewrite Location headers so redirects keep working behind the prefix."""
+
+    def __init__(self, app: ASGIApp, root_path: str) -> None:
+        self.app = app
+        self.root_path = root_path.rstrip("/")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not self.root_path:
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                # Read the host here rather than up front: uvicorn's
+                # proxy-header handling rewrites it from X-Forwarded-Host.
+                host = next(
+                    (v.decode() for k, v in scope["headers"] if k == b"host"),
+                    "",
+                )
+                message["headers"] = [
+                    (
+                        (k, prefix_location(v.decode(), self.root_path, host).encode())
+                        if k.lower() == b"location"
+                        else (k, v)
+                    )
+                    for k, v in message["headers"]
+                ]
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
 class RequestLogMiddleware:
@@ -143,6 +202,7 @@ def create_app() -> FastAPI:
         root_path=settings.root_path,
     )
     app.add_middleware(RequestLogMiddleware)
+    app.add_middleware(RootPathRedirectMiddleware, root_path=settings.root_path)
 
     @app.exception_handler(Exception)
     def unhandled(request: Request, exc: Exception) -> JSONResponse:

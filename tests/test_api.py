@@ -180,6 +180,44 @@ def test_index_returns_json(client: AsgiClient) -> None:
 
 
 # ---------------------------------------------------------------------------
+# redirects behind the /locatron prefix
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        # Starlette's slash redirect, built from the path nginx already stripped.
+        ("http://testserver/v1/resolve?text=x", "http://testserver/locatron/v1/resolve?text=x"),
+        ("/v1/resolve", "/locatron/v1/resolve"),
+        # Already prefixed, so left alone. Prefixing twice is the worse bug.
+        ("/locatron/v1/resolve", "/locatron/v1/resolve"),
+        ("/locatron", "/locatron"),
+        # A path that merely starts with the same letters is not prefixed yet.
+        ("/locatronic", "/locatron/locatronic"),
+        # Someone else's host, and a relative target, are not ours to rewrite.
+        ("https://elsewhere.example/v1/resolve", "https://elsewhere.example/v1/resolve"),
+        ("docs", "docs"),
+        ("", ""),
+    ],
+)
+def test_prefix_location(location: str, expected: str) -> None:
+    assert api.prefix_location(location, "/locatron", "testserver") == expected
+
+
+def test_prefix_location_noop_without_root_path() -> None:
+    assert api.prefix_location("/v1/resolve", "", "testserver") == "/v1/resolve"
+
+
+def test_trailing_slash_redirect_keeps_the_prefix(client: AsgiClient, fake_resolver: list) -> None:
+    """The edge only knows /locatron/..., so the Location header must carry it."""
+    r = client.get("/v1/resolve/", params={"text": "Melbourne"})
+    assert r.status == 307
+    assert r.headers["location"] == "http://testserver/locatron/v1/resolve?text=Melbourne"
+    assert fake_resolver == []
+
+
+# ---------------------------------------------------------------------------
 # /healthz
 # ---------------------------------------------------------------------------
 
