@@ -15,6 +15,7 @@ ExecStart=/opt/locatron/venv/bin/gunicorn locatron.bulk.app:app \
     --worker-class uvicorn.workers.UvicornWorker \
     --workers 2 \
     --bind 127.0.0.1:8081 \
+    --forwarded-allow-ips="127.0.0.1" \
     --timeout 3600 \
     --graceful-timeout 60 \
     --access-logfile - \

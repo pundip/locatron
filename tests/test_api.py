@@ -161,6 +161,25 @@ needs_db = pytest.mark.skipif(not _db_available(), reason="ReferenceDB unreachab
 
 
 # ---------------------------------------------------------------------------
+# /
+# ---------------------------------------------------------------------------
+
+
+def test_index_returns_json(client: AsgiClient) -> None:
+    """The bare public URL must answer, not redirect. No database involved."""
+    r = client.get("/")
+    assert r.status == 200
+    assert r.headers["content-type"].startswith("application/json")
+    body = r.json()
+    assert body["service"] == "locatron"
+    assert body["version"]
+    # Links carry the public prefix, since nginx strips it before the app.
+    assert body["docs"] == "/locatron/docs"
+    assert body["healthz"] == "/locatron/healthz"
+    assert body["resolve"] == "/locatron/v1/resolve"
+
+
+# ---------------------------------------------------------------------------
 # /healthz
 # ---------------------------------------------------------------------------
 

@@ -20,7 +20,7 @@ import logging
 import sys
 import time
 from importlib.metadata import PackageNotFoundError, version
-from typing import Annotated
+from typing import Annotated, Any
 
 import structlog
 from fastapi import FastAPI, Query, Request
@@ -159,6 +159,24 @@ def create_app() -> FastAPI:
             warnings=[f"internal error: {type(exc).__name__}: {exc}"],
         )
         return JSONResponse(status_code=500, content=body.model_dump(mode="json"))
+
+    @app.get("/", tags=["ops"])
+    def index() -> dict[str, Any]:
+        """What the bare public URL lands on.
+
+        Without a route here, /locatron/ resolves to no route at all. Links are
+        prefixed with root_path so they work from the public side, where nginx
+        has stripped /locatron before the app sees the path.
+        """
+        base = settings.root_path.rstrip("/")
+        return {
+            "service": "locatron",
+            "version": __version__,
+            "docs": f"{base}/docs",
+            "openapi": f"{base}/openapi.json",
+            "healthz": f"{base}/healthz",
+            "resolve": f"{base}/v1/resolve",
+        }
 
     @app.get("/healthz", tags=["ops"])
     def healthz() -> JSONResponse:
