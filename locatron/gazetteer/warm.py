@@ -89,33 +89,38 @@ def is_warm() -> bool:
 
 
 def warm() -> dict[str, float]:
-    """Load all gazetteers, returning per-loader milliseconds.
+    """Ready this worker: open the street mirror, then load the gazetteers.
 
-    Never raises. A failure here must not take the worker down: the loaders are
-    still lazy, so an unwarmed worker serves correctly and merely pays the cost
-    on its first request. Crashing instead would turn a transient MySQL blip
-    into a restart loop that removes the whole service.
+    Raises only for the street mirror. A gazetteer that fails to load is
+    swallowed -- the loaders are lazy, so an unwarmed worker still answers
+    correctly and merely pays the cost on its first request, and crashing would
+    turn a transient MySQL blip into a restart loop that removes the service.
+
+    A missing or stale mirror is different in kind and propagates on purpose.
+    There is no lazy fallback for it: serving anyway would mean answering from
+    MySQL or from nothing, which is the silent-miss failure the mirror exists to
+    prevent. Better a worker that will not start than one that quietly stops
+    finding streets.
     """
     timings: dict[str, float] = {}
     started = time.perf_counter()
 
-    # The street mirror, opened here and nowhere earlier: a sqlite3 connection
-    # must be created after the fork, or several workers share one cursor and one
-    # lock. Unlike a gazetteer load this is allowed to fail the worker -- a
-    # missing or stale mirror has no safe fallback, and serving from MySQL
-    # instead is the silent-miss failure the mirror exists to prevent.
-    at = time.perf_counter()
-    meta = local.check_mirror()
-    local.connect()
-    timings["streets"] = round((time.perf_counter() - at) * 1000.0, 1)
-    log.info(
-        "street_mirror_open",
-        ms=timings["streets"],
-        rows=meta.row_count,
-        norm_version=meta.norm_version,
-        snapshot_id=meta.snapshot_id,
-        built_at=meta.built_at,
-    )
+    # Opened here and nowhere earlier: a sqlite3 connection must be created after
+    # the fork, or several workers share one cursor and one lock. Skipped when
+    # already open, so warm() stays idempotent.
+    if not local.is_open():
+        at = time.perf_counter()
+        meta = local.check_mirror()
+        local.connect()
+        timings["streets"] = round((time.perf_counter() - at) * 1000.0, 1)
+        log.info(
+            "street_mirror_open",
+            ms=timings["streets"],
+            rows=meta.row_count,
+            norm_version=meta.norm_version,
+            snapshot_id=meta.snapshot_id,
+            built_at=meta.built_at,
+        )
 
     for name, loader, counts in LOADERS:
         if _is_loaded(loader):

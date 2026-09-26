@@ -38,6 +38,37 @@ class _Loader:
         return self._loaded
 
 
+@pytest.fixture(autouse=True)
+def _stub_mirror(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand in for the SQLite street mirror.
+
+    warm() opens it for real, so without this every test here would need a
+    built 54 MB file. The mirror's own behaviour is covered in
+    tests/parse/test_street.py.
+    """
+    from locatron.db import local
+
+    opened = {"yes": False}
+
+    def connect() -> None:
+        opened["yes"] = True
+
+    monkeypatch.setattr(warm_mod.local, "is_open", lambda: opened["yes"])
+    monkeypatch.setattr(warm_mod.local, "connect", connect)
+    monkeypatch.setattr(
+        warm_mod.local,
+        "check_mirror",
+        lambda: local.MirrorMeta(
+            norm_version="1",
+            snapshot_id="test",
+            source_digest="d",
+            row_count=1,
+            built_at="now",
+            path="stub",
+        ),
+    )
+
+
 @pytest.fixture
 def loaders(monkeypatch: pytest.MonkeyPatch) -> dict[str, _Loader]:
     made = {"au": _Loader(), "cities": _Loader(), "countries": _Loader()}
@@ -54,7 +85,7 @@ def loaders(monkeypatch: pytest.MonkeyPatch) -> dict[str, _Loader]:
 
 def test_warm_loads_every_gazetteer_once(loaders: dict[str, _Loader]) -> None:
     timings = warm_mod.warm()
-    assert sorted(timings) == ["au", "cities", "countries"]
+    assert sorted(timings) == ["au", "cities", "countries", "streets"]
     assert all(ldr.calls == 1 for ldr in loaders.values())
     assert warm_mod.is_warm() is True
 
@@ -63,6 +94,7 @@ def test_warm_is_idempotent(loaders: dict[str, _Loader]) -> None:
     """A second call must not reload. Nothing calls it twice today, but a
     worker that warmed already should not pay again if something does."""
     warm_mod.warm()
+    # Once open, the mirror is not reopened either.
     second = warm_mod.warm()
     assert all(ldr.calls == 1 for ldr in loaders.values())
     assert second == {}
@@ -74,7 +106,7 @@ def test_warm_never_raises_when_a_loader_fails(loaders: dict[str, _Loader]) -> N
     timings = warm_mod.warm()
 
     # The failure is recorded and the other two still load.
-    assert sorted(timings) == ["au", "cities", "countries"]
+    assert sorted(timings) == ["au", "cities", "countries", "streets"]
     assert loaders["au"].is_loaded() and loaders["countries"].is_loaded()
     assert warm_mod.is_warm() is False
 
@@ -191,3 +223,31 @@ def test_every_loader_has_a_counts_callable_returning_a_dict() -> None:
         out = counts(fakes[name])
         assert isinstance(out, dict) and out, name
         assert all(isinstance(v, int) for v in out.values()), name
+
+
+# ---------------------------------------------------------------------------
+# the street mirror is the one failure that propagates
+# ---------------------------------------------------------------------------
+
+
+def test_a_missing_mirror_fails_the_worker(
+    loaders: dict[str, _Loader], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unlike a gazetteer load, this must not be swallowed. There is no lazy
+    fallback for streets, so a worker that cannot open the mirror must refuse to
+    start rather than quietly stop finding them."""
+    from locatron.db import local
+
+    def boom() -> None:
+        raise local.MirrorError("street mirror missing at /nowhere")
+
+    monkeypatch.setattr(warm_mod.local, "check_mirror", boom)
+    with pytest.raises(local.MirrorError):
+        warm_mod.warm()
+
+
+def test_a_gazetteer_failure_is_still_swallowed(loaders: dict[str, _Loader]) -> None:
+    """The contrast: a transient MySQL blip must not restart-loop the service."""
+    loaders["cities"].boom = True
+    warm_mod.warm()  # does not raise
+    assert warm_mod.is_warm() is False
