@@ -495,3 +495,93 @@ def test_fuzzy_can_reach_a_junk_string_but_only_at_low_confidence() -> None:
     assert hyps[0].confidence < 0.35, hyps[0].confidence
     # Well below any corroborated hit.
     assert hyps[0].confidence < _hyps("3201")[2][0].confidence
+
+
+# ---------------------------------------------------------------------------
+# the postcode-path gate
+# ---------------------------------------------------------------------------
+#
+# The path is suppressed only when a named candidate already agrees with the
+# postcode. When names matched but none of them agree, the path is the only
+# thing that can reach the right locality, so it runs alongside them.
+
+
+@needs_db
+def test_postcode_path_runs_when_no_named_candidate_agrees() -> None:
+    """'12 Clifton Street 3201': CLIFTON is the street, not the suburb. The
+    CLIFTON localities all sit in other postcodes, so CARRUM DOWNS is reachable
+    only through 3201 and must still win."""
+    ts, consumed, hyps = _hyps("12 Clifton Street 3201")
+    top = hyps[0]
+    assert (top.candidate.locality, top.candidate.state, top.candidate.postcode) == (
+        "CARRUM DOWNS",
+        "VIC",
+        "3201",
+    )
+    assert "postcode_agree" in top.signals
+    # Reached by postcode, so it consumed no name token.
+    assert len(top.locality_span) == 0
+
+    # Every CLIFTON is present as a candidate and every one of them loses.
+    cliftons = [h for h in hyps if h.candidate.locality == "CLIFTON"]
+    assert cliftons, "CLIFTON is a real locality and must still be proposed"
+    assert all(h.score < top.score for h in cliftons)
+    assert all("postcode_disagree" in h.signals for h in cliftons)
+
+    assert _street_text("12 Clifton Street 3201") == ["CLIFTON STREET"]
+    assert ts.text_of(consumed[0]) == "12"
+
+
+@needs_db
+def test_common_locality_name_used_as_a_street() -> None:
+    """'Richmond Road 3201': the same shape with a name that is a locality in
+    five states, which is the case most likely to go wrong."""
+    _ts, _consumed, hyps = _hyps("Richmond Road 3201")
+    top = hyps[0]
+    assert (top.candidate.locality, top.candidate.postcode) == ("CARRUM DOWNS", "3201")
+    richmonds = [h for h in hyps if h.candidate.locality == "RICHMOND"]
+    assert len(richmonds) >= 5
+    assert all(h.score < top.score for h in richmonds)
+    assert _street_text("Richmond Road 3201") == ["RICHMOND ROAD"]
+
+
+@needs_db
+def test_postcode_path_is_suppressed_when_a_named_candidate_agrees() -> None:
+    """'Hamilton Crescent Ryde NSW 2112': RYDE itself sits in 2112, so the other
+    localities in that postcode must not arrive as near-ties for it."""
+    _ts, _consumed, hyps = _hyps("Hamilton Crescent Ryde NSW 2112")
+    assert hyps[0].candidate.locality == "RYDE"
+    localities = {h.candidate.locality for h in hyps}
+    assert "PUTNEY" not in localities
+    assert "DENISTONE EAST" not in localities
+    # Everything proposed was reached by name, not by postcode.
+    assert all(len(h.locality_span) > 0 for h in hyps)
+
+
+@needs_db
+def test_agreement_by_any_named_candidate_suppresses_the_path() -> None:
+    """The gate asks whether *some* named candidate agrees, not the top one. On
+    '65 clifton park drive 3201 carrum downs' CARRUM DOWNS agrees, so the path
+    stays off even though CLIFTON localities were also named."""
+    _ts, _consumed, hyps = _hyps("65 clifton park drive 3201 carrum downs")
+    assert all(len(h.locality_span) > 0 for h in hyps)
+
+
+@needs_db
+def test_bare_postcode_still_works_with_no_names_at_all() -> None:
+    """The gate must not break the case it was written around."""
+    _ts, _consumed, hyps = _hyps("3201")
+    assert hyps[0].candidate.locality == "CARRUM DOWNS"
+    assert len(hyps[0].locality_span) == 0
+
+
+@needs_db
+def test_street_tokens_survive_a_postcode_path_win() -> None:
+    """A postcode-path hypothesis consumes the postcode and the state, never a
+    name, so the street stage still gets everything it needs."""
+    for raw, expected in [
+        ("12 Clifton Street 3201", ["CLIFTON STREET"]),
+        ("Richmond Road 3201", ["RICHMOND ROAD"]),
+        ("14-40 Wills Street 3000", ["WILLS STREET"]),
+    ]:
+        assert _street_text(raw) == expected, raw

@@ -361,14 +361,23 @@ def generate_hypotheses(
         for cand in candidates_for_key(au, gram.key):
             found.append((cand, gram.span))
 
-    # A *bare* postcode, with no locality named anywhere: '3201' is a golden
-    # row. Gated on nothing having been named, because a postcode-only
-    # hypothesis consumes no name token and so competes unfairly with a real
-    # one: on 'Hamilton Crescent Ryde NSW 2112' it offered PUTNEY and
-    # DENISTONE EAST, which also sit in 2112, as near-ties for RYDE and left
-    # RYDE's own token unconsumed. Corroborating a named locality is what
-    # POSTCODE_AGREE is for; this path is only for when there is no name.
-    if not found:
+    # The postcode path: every locality sharing a postcode token, carrying an
+    # empty locality span because it consumed no name.
+    #
+    # Suppressed only when a named candidate already agrees with the postcode.
+    # That is the case where the path adds nothing but noise: on
+    # 'Hamilton Crescent Ryde NSW 2112', RYDE itself sits in 2112, so PUTNEY and
+    # DENISTONE EAST would arrive as near-ties for it while leaving RYDE's own
+    # token unconsumed. Corroborating a named locality is POSTCODE_AGREE's job.
+    #
+    # When no named candidate agrees, the path is the only thing that can find
+    # the right answer, and it runs even though names were matched. On
+    # '12 Clifton Street 3201' the named candidates are CLIFTON localities in
+    # other postcodes -- CLIFTON is a street here, not the suburb -- and
+    # CARRUM DOWNS is reachable only through 3201. Scoring then ranks them:
+    # an agreeing postcode outweighs a name whose postcode contradicts it.
+    named_postcodes = {c.postcode for c, _ in found}
+    if not (postcode_values & named_postcodes):
         for pc, _span in postcodes:
             for cand in candidates_for_postcode(au, pc):
                 found.append((cand, Span(0, 0)))
