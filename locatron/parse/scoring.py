@@ -137,6 +137,10 @@ class Weights:
     alias_trust_weight: float = ALIAS_TRUST_WEIGHT
     score_full: float = SCORE_FULL
     ambiguity_penalty_max: float = AMBIGUITY_PENALTY_MAX
+    name_similarity_min: float = 58.0
+    type_mismatch_penalty: float = -0.30
+    street_match_weight: float = 1.20
+    unexplained_token_penalty: float = -0.60
 
 
 DEFAULT_WEIGHTS = Weights()
@@ -272,3 +276,30 @@ NAME_SIMILARITY_MIN = 58.0
 #: match is never displaced by a mismatch on a marginally better name. 0.30 sits
 #: in that band with room either side.
 TYPE_MISMATCH_PENALTY = -0.30
+
+
+#: How many locality hypotheses get street matching. Not only the top one: a
+#: weaker locality whose streets contain the input must be able to overtake a
+#: stronger one whose streets do not. Three covers the homonym cases the golden
+#: set probes without turning one resolve into a sweep of every Richmond.
+STREET_HYPOTHESES = 3
+
+#: Weight on a street match's own 0-1 score. Large enough that a confirmed street
+#: can overturn a locality ordering -- which is the whole reason for matching
+#: against three hypotheses -- and not so large that it outweighs an agreeing
+#: postcode plus a stated state.
+STREET_MATCH_WEIGHT = 1.20
+
+#: Per token that no stage explained: not a number, unit, postcode, PO box,
+#: state, locality or street.
+#:
+#: This is what makes CARRUM DOWNS beat CARRUM on 'Carrum Downs VIC'. Without it
+#: the two differ only by one n-gram token bonus, 0.15, because both are real
+#: localities and both agree with the state. With it, reading CARRUM leaves DOWNS
+#: explained by nothing -- Carrum has no street called DOWNS -- and the gap
+#: becomes wide enough to be safe.
+#:
+#: Sized above NGRAM_TOKEN_BONUS so a longer locality name always beats a
+#: shorter one plus a loose end, and below BASE_EXACT so a single stray token
+#: cannot annihilate an otherwise good parse.
+UNEXPLAINED_TOKEN_PENALTY = -0.60

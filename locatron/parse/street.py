@@ -36,8 +36,16 @@ from rapidfuzz.distance import Levenshtein
 from sqlalchemy import text
 
 from locatron.db import mysql
-from locatron.parse.scoring import NAME_SIMILARITY_MIN, TYPE_MISMATCH_PENALTY
-from locatron.parse.tokens import Span
+from locatron.parse.locality import Hypothesis as LocalityHypothesis
+from locatron.parse.locality import ngram_spans
+from locatron.parse.scoring import (
+    DEFAULT_WEIGHTS,
+    NAME_SIMILARITY_MIN,
+    STREET_HYPOTHESES,
+    TYPE_MISMATCH_PENALTY,
+    Weights,
+)
+from locatron.parse.tokens import Span, TokenStream
 
 #: (state, locality, postcode) — the grain of `locatron_street`, and what a
 #: locality hypothesis supplies.
@@ -559,6 +567,150 @@ def match_streets(
                 not m.type_matched,
                 -m.row.address_count,
                 m.street_key,
+            ),
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# joint scoring
+# ---------------------------------------------------------------------------
+
+
+def _net_contribution(
+    ts: TokenStream,
+    claimed: Sequence[Span],
+    match: StreetMatch | None,
+    weights: Weights,
+) -> float:
+    """What choosing `match` is worth: the street score it earns, less the cost
+    of every token it leaves for nobody to explain.
+
+    Span selection goes by this rather than by match score alone. Match score
+    alone preferred a shorter span that looked better in isolation --
+    'CLIFTON STREET' matched the single token CLIFTON to CLIFTON GR at a clean
+    1.00 and orphaned STREET, rather than matching both tokens at 0.70 and
+    reporting the type mismatch. Same street either way, but a mismatch has to
+    stay visible instead of being relabelled as noise.
+    """
+    spans = [*claimed, match.span] if match is not None else list(claimed)
+    tokens_left = sum(len(sp) for sp in ts.runs(spans))
+    earned = weights.street_match_weight * match.match_score if match is not None else 0.0
+    return earned + weights.unexplained_token_penalty * tokens_left
+
+
+@dataclass(frozen=True, slots=True)
+class StreetHypothesis:
+    """A locality reading plus the street it explains, scored together."""
+
+    locality: LocalityHypothesis
+    street: StreetMatch | None
+    """None when nothing cleared NAME_SIMILARITY_MIN. The hypothesis is then
+    locality-only and its street tokens count as unexplained."""
+    score: float
+    signals: dict[str, float]
+    unexplained: tuple[Span, ...]
+    """Runs no stage explained. Empty is the goal."""
+
+    @property
+    def granularity(self) -> str:
+        return "street" if self.street is not None else "locality"
+
+    @property
+    def unexplained_tokens(self) -> int:
+        return sum(len(s) for s in self.unexplained)
+
+    def consumed(self) -> tuple[Span, ...]:
+        spans = list(self.locality.consumed)
+        if self.street is not None:
+            spans.append(self.street.span)
+        return tuple(sorted(spans))
+
+
+def resolve_streets(
+    ts: TokenStream,
+    hypotheses: Sequence[LocalityHypothesis],
+    *,
+    consumed: Sequence[Span] = (),
+    source: StreetSource = streets_for_many,
+    top_n: int = STREET_HYPOTHESES,
+    weights: Weights = DEFAULT_WEIGHTS,
+) -> tuple[StreetHypothesis, ...]:
+    """Match streets against the top `top_n` locality hypotheses and rerank.
+
+    `consumed` are the spans Prompt A's extractors claimed -- street number,
+    unit, PO box -- which never become part of a street name.
+
+    All the localities are fetched in one call to `source`, so a resolve costs
+    one round trip rather than one per hypothesis. `source` is an argument so a
+    test can inject a fixture and so the SQLite mirror, when it lands, replaces
+    one function.
+
+    Reranking is the point: a weaker locality whose streets contain the input can
+    overtake a stronger one whose streets do not.
+    """
+    if not hypotheses:
+        return ()
+
+    considered = list(hypotheses[:top_n])
+    keys = [(h.candidate.state, h.candidate.locality, h.candidate.postcode) for h in considered]
+    store = source(keys)
+
+    out: list[StreetHypothesis] = []
+    for h, key in zip(considered, keys, strict=True):
+        claimed = [*consumed, *h.consumed]
+        rows = store.get(key, ())
+
+        # Every contiguous span of what is left, longest first. Contiguity is
+        # structural: ngram_spans generates within runs, so a street can never be
+        # stitched out of tokens on both sides of the locality.
+        # Chosen on net contribution, not match score. See _net_contribution.
+        best: StreetMatch | None = None
+        best_net = _net_contribution(ts, claimed, None, weights)
+        for gram in ngram_spans(ts, claimed):
+            # match_streets is sorted, so its head is this span's best.
+            matches = match_streets(tuple(t.text for t in ts.slice(gram.span)), gram.span, rows)
+            if not matches:
+                continue
+            candidate_net = _net_contribution(ts, claimed, matches[0], weights)
+            if candidate_net > best_net:
+                best, best_net = matches[0], candidate_net
+
+        street_claimed = [*claimed, best.span] if best is not None else claimed
+        leftover = ts.runs(street_claimed)
+
+        parts = dict(h.signals)
+        if best is not None:
+            parts["street_match"] = weights.street_match_weight * best.match_score
+            if best.type_mismatch:
+                # Already inside match_score; surfaced so a breakdown shows why.
+                parts["street_type_mismatch"] = weights.type_mismatch_penalty
+                parts["street_match"] -= weights.type_mismatch_penalty * (
+                    weights.street_match_weight
+                )
+        n_left = sum(len(s) for s in leftover)
+        if n_left:
+            parts["unexplained_tokens"] = weights.unexplained_token_penalty * n_left
+
+        out.append(
+            StreetHypothesis(
+                locality=h,
+                street=best,
+                score=sum(parts.values()),
+                signals=parts,
+                unexplained=leftover,
+            )
+        )
+
+    return tuple(
+        sorted(
+            out,
+            key=lambda s: (
+                -s.score,
+                s.unexplained_tokens,
+                -s.locality.candidate.address_count,
+                s.locality.candidate.state,
+                s.locality.candidate.postcode,
             ),
         )
     )
