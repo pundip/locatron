@@ -82,9 +82,7 @@ def find_postcodes(ts: TokenStream) -> tuple[PostcodeCandidate, ...]:
             out.append(PostcodeCandidate(postcode=token.text, span=token.span))
         elif _SHORT_POSTCODE_RE.match(token.text):
             out.append(
-                PostcodeCandidate(
-                    postcode=token.text.rjust(4, "0"), span=token.span, padded=True
-                )
+                PostcodeCandidate(postcode=token.text.rjust(4, "0"), span=token.span, padded=True)
             )
     return tuple(out)
 
@@ -125,4 +123,123 @@ def find_po_boxes(ts: TokenStream) -> tuple[PoBox, ...]:
             i = end  # the loop's own increment steps past the number
             break
         i += 1
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# unit and level
+# ---------------------------------------------------------------------------
+
+#: Keywords that introduce a sub-dwelling, mapping to the G-NAF FLAT_TYPE they
+#: correspond to. Deliberately short: exactly the forms the golden set uses.
+#: G-NAF's FLAT_TYPE vocabulary is far wider -- APARTMENT, SUITE, OFFICE,
+#: PENTHOUSE, TOWER and about thirty more -- and adding one is a line here. But
+#: every keyword added is a token taken away from the street name, and a
+#: single-letter one like F costs more than it earns, so entries are added on
+#: evidence from locatron_unresolved rather than on guesswork.
+_UNIT_WORDS: dict[str, str] = {
+    "UNIT": "UNIT",
+    "U": "UNIT",
+    "FLAT": "FLAT",
+    "SHOP": "SHOP",
+}
+
+#: Keywords that introduce a level, mapping to the G-NAF LEVEL_TYPE.
+_LEVEL_WORDS: dict[str, str] = {
+    "LEVEL": "LEVEL",
+    "L": "LEVEL",
+}
+
+#: A unit value: digits with an optional alpha suffix, or a letter-led form like
+#: G01 that appears on ground-floor units.
+_UNIT_VALUE_RE = re.compile(rf"^(?:{_NUMBER}|[A-Z][0-9]{{1,4}})$")
+
+#: The slash form. '5/12' is a unit and a street number in one token, which is
+#: the ordinary Australian way of writing it. The right-hand side is left as
+#: text because it may itself be a range: '1/14-40'.
+_SLASH_RE = re.compile(rf"^({_NUMBER}|[A-Z][0-9]{{1,4}})/(.+)$")
+
+
+@dataclass(frozen=True, slots=True)
+class UnitLevel:
+    """A unit or a level, and the tokens it consumed."""
+
+    kind: str
+    """'unit' or 'level'."""
+    value: str
+    """As written, suffix included. '5', '12A', 'G01'."""
+    span: Span
+    keyword: str | None = None
+    """The G-NAF type the keyword maps to: 'UNIT', 'FLAT', 'LEVEL'. None for the
+    slash form, which states a unit without naming its type."""
+    street_number_hint: str | None = None
+    """For '5/12', the '12'. The street number extractor proposes this token
+    independently; this field exists so a caller that has already consumed the
+    unit does not have to re-split the token to find the number."""
+
+
+def find_units_and_levels(ts: TokenStream) -> tuple[UnitLevel, ...]:
+    """Every unit and level candidate, in token order.
+
+    Three shapes, all of which appear in real input:
+
+    >>> from locatron.parse.tokens import tokenize
+    >>> [(u.kind, u.value, u.street_number_hint)
+    ...  for u in find_units_and_levels(tokenize("5/12 Smith Street"))]
+    [('unit', '5', '12')]
+    >>> [(u.kind, u.value, u.keyword)
+    ...  for u in find_units_and_levels(tokenize("Unit 5 12 Smith Street"))]
+    [('unit', '5', 'UNIT')]
+    >>> [(u.kind, u.value) for u in find_units_and_levels(tokenize("Level 3 Shop 2"))]
+    [('level', '3'), ('unit', '2')]
+    """
+    out: list[UnitLevel] = []
+
+    for token in ts:
+        # The slash form stands alone: one token carries both numbers.
+        slash = _SLASH_RE.match(token.text)
+        if slash:
+            out.append(
+                UnitLevel(
+                    kind="unit",
+                    value=slash.group(1),
+                    span=token.span,
+                    street_number_hint=slash.group(2),
+                )
+            )
+            continue
+
+        # A keyword claims the token after it, if that token looks like a value.
+        kind, words = (
+            ("unit", _UNIT_WORDS) if token.text in _UNIT_WORDS else ("level", _LEVEL_WORDS)
+        )
+        if token.text not in words:
+            continue
+        nxt = ts.at(token.index + 1)
+        if nxt is None:
+            continue
+
+        # 'UNIT 5/12' states the type and then the slash form. Take the unit
+        # from the left of the slash and keep the hint, rather than rejecting it.
+        nested = _SLASH_RE.match(nxt.text)
+        if nested:
+            out.append(
+                UnitLevel(
+                    kind=kind,
+                    value=nested.group(1),
+                    span=Span(token.index, nxt.index + 1),
+                    keyword=words[token.text],
+                    street_number_hint=nested.group(2),
+                )
+            )
+        elif _UNIT_VALUE_RE.match(nxt.text):
+            out.append(
+                UnitLevel(
+                    kind=kind,
+                    value=nxt.text,
+                    span=Span(token.index, nxt.index + 1),
+                    keyword=words[token.text],
+                )
+            )
+
     return tuple(out)

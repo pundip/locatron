@@ -15,7 +15,11 @@ from pathlib import Path
 
 import pytest
 
-from locatron.parse.components import find_po_boxes, find_postcodes
+from locatron.parse.components import (
+    find_po_boxes,
+    find_postcodes,
+    find_units_and_levels,
+)
 from locatron.parse.tokens import tokenize
 
 GOLDEN = Path(__file__).resolve().parent.parent / "golden" / "golden.csv"
@@ -169,9 +173,7 @@ def test_postcode_position_is_not_assumed() -> None:
         ("100", ["0100"]),
     ],
 )
-def test_three_digit_tokens_come_back_padded_and_flagged(
-    raw: str, expected: list[str]
-) -> None:
+def test_three_digit_tokens_come_back_padded_and_flagged(raw: str, expected: list[str]) -> None:
     """Recovered, but marked, so a scorer can weight them down or drop them."""
     cands = find_postcodes(tokenize(raw))
     assert [c.postcode for c in cands] == expected
@@ -259,9 +261,138 @@ def test_po_box_number_is_not_also_swallowed_by_the_next_scan() -> None:
     assert [(b.number, b.span.start) for b in boxes] == [("45", 0), ("46", 3)]
 
 
-@pytest.mark.parametrize(
-    "raw", [r for r in AU_INPUTS + NON_AU_INPUTS if "Box" not in r]
-)
+@pytest.mark.parametrize("raw", [r for r in AU_INPUTS + NON_AU_INPUTS if "Box" not in r])
 def test_no_po_box_in_rows_that_have_none(raw: str) -> None:
     """Every golden row except the PO Box one must yield nothing."""
     assert find_po_boxes(tokenize(raw)) == ()
+
+
+# ---------------------------------------------------------------------------
+# units and levels
+# ---------------------------------------------------------------------------
+
+#: The only two golden rows with a sub-dwelling, as (kind, value, keyword, hint).
+EXPECTED_UNITS: dict[str, list[tuple[str, str, str | None, str | None]]] = {
+    "5/12 Smith Street Fitzroy VIC 3065": [("unit", "5", None, "12")],
+    "Unit 5 12 Smith Street Fitzroy 3065": [("unit", "5", "UNIT", None)],
+}
+
+
+@pytest.mark.parametrize("raw", ALL_INPUTS)
+def test_units_in_every_golden_row(raw: str) -> None:
+    """28 of the 30 rows must yield nothing. A keyword list that over-matches
+    steals tokens from the street name, so this is the guard against that."""
+    got = [
+        (u.kind, u.value, u.keyword, u.street_number_hint)
+        for u in find_units_and_levels(tokenize(raw))
+    ]
+    assert got == EXPECTED_UNITS.get(raw, [])
+
+
+@pytest.mark.parametrize(
+    ("raw", "kind", "value", "keyword", "span"),
+    [
+        ("UNIT 5", "unit", "5", "UNIT", (0, 2)),
+        ("Unit 5", "unit", "5", "UNIT", (0, 2)),
+        ("U 5", "unit", "5", "UNIT", (0, 2)),
+        ("FLAT 5", "unit", "5", "FLAT", (0, 2)),
+        ("Flat 12A", "unit", "12A", "FLAT", (0, 2)),
+        ("SHOP 2", "unit", "2", "SHOP", (0, 2)),
+        ("L 3", "level", "3", "LEVEL", (0, 2)),
+        ("LEVEL 3", "level", "3", "LEVEL", (0, 2)),
+        ("Level 12", "level", "12", "LEVEL", (0, 2)),
+        # Letter-led unit values, as used on ground floors.
+        ("UNIT G01", "unit", "G01", "UNIT", (0, 2)),
+    ],
+)
+def test_keyword_forms(
+    raw: str, kind: str, value: str, keyword: str, span: tuple[int, int]
+) -> None:
+    (u,) = find_units_and_levels(tokenize(raw))
+    assert (u.kind, u.value, u.keyword) == (kind, value, keyword)
+    assert (u.span.start, u.span.end) == span
+    assert u.street_number_hint is None
+
+
+@pytest.mark.parametrize(
+    ("raw", "unit", "hint"),
+    [
+        ("5/12", "5", "12"),
+        ("5/12 Smith Street", "5", "12"),
+        ("12A/34", "12A", "34"),
+        # The right-hand side may itself be a range.
+        ("1/14-40", "1", "14-40"),
+        ("2/6C", "2", "6C"),
+    ],
+)
+def test_slash_form(raw: str, unit: str, hint: str) -> None:
+    (u,) = find_units_and_levels(tokenize(raw))
+    assert (u.kind, u.value, u.keyword, u.street_number_hint) == ("unit", unit, None, hint)
+    assert (u.span.start, u.span.end) == (0, 1), "the slash form is one token"
+
+
+def test_keyword_plus_slash_yields_both_readings() -> None:
+    """'UNIT 5/12' is the keyword form and the slash form at once. Both are
+    returned, longest span first, and the scorer picks."""
+    got = find_units_and_levels(tokenize("UNIT 5/12 Smith Street"))
+    assert [(u.value, u.keyword, u.street_number_hint) for u in got] == [
+        ("5", "UNIT", "12"),
+        ("5", None, "12"),
+    ]
+    assert len(got[0].span) == 2
+    assert len(got[1].span) == 1
+    assert got[0].span.overlaps(got[1].span)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "UNIT",  # keyword with nothing after it
+        "LEVEL",
+        "UNIT SMITH",  # next token is not a value
+        "LEVEL STREET",
+        "5 UNIT",  # wrong order
+        "14-40 Wills Street",  # a range is not a unit
+        "Ku-ring-gai NSW",  # hyphens, no digits
+        "Remote / Work from home",  # a bare slash token
+        "/",
+        "3201",
+        "",
+    ],
+)
+def test_not_a_unit_or_level(raw: str) -> None:
+    assert find_units_and_levels(tokenize(raw)) == ()
+
+
+def test_unit_and_level_together() -> None:
+    got = find_units_and_levels(tokenize("Level 3 Shop 2 Smith Street"))
+    assert [(u.kind, u.value) for u in got] == [("level", "3"), ("unit", "2")]
+    assert got[0].span.end <= got[1].span.start
+
+
+def test_spelled_unit_leaves_the_street_number_behind() -> None:
+    """'UNIT 5 12 SMITH ST': the extractor claims 'UNIT 5' and the 12 is left
+    for the street number extractor."""
+    ts = tokenize("Unit 5 12 Smith Street Fitzroy 3065")
+    (u,) = find_units_and_levels(ts)
+    assert ts.text_of(u.span) == "UNIT 5"
+    assert tuple(t.text for t in ts.remaining([u.span])) == (
+        "12",
+        "SMITH",
+        "STREET",
+        "FITZROY",
+        "3065",
+    )
+
+
+def test_slash_form_consumes_only_its_own_token() -> None:
+    ts = tokenize("5/12 Smith Street Fitzroy VIC 3065")
+    (u,) = find_units_and_levels(ts)
+    assert ts.text_of(u.span) == "5/12"
+    assert tuple(t.text for t in ts.remaining([u.span])) == (
+        "SMITH",
+        "STREET",
+        "FITZROY",
+        "VIC",
+        "3065",
+    )
