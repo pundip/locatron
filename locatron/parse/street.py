@@ -614,6 +614,27 @@ def _net_contribution(
 
 
 @dataclass(frozen=True, slots=True)
+class TypeSubstitution:
+    """A street type the matcher used in place of the one the input asked for.
+
+    Only ever produced when no same-name street in that locality carries the
+    input's type, so it records an accepted substitution rather than an error.
+    """
+
+    written_as: str
+    """The trailing word as written: 'STREET'. What a response should echo."""
+    input_type: str
+    """The G-NAF code that token denotes: 'ST'. Empty if it denoted none.
+
+    Single rather than a set: every token in the table maps to exactly one code,
+    and `codes_for_token` is sorted so a future many-to-one entry stays stable
+    instead of varying between runs.
+    """
+    matched_type: str
+    """The stored type actually matched: 'GR'. Blank for a typeless street."""
+
+
+@dataclass(frozen=True, slots=True)
 class StreetHypothesis:
     """A locality reading plus the street it explains, scored together."""
 
@@ -625,6 +646,13 @@ class StreetHypothesis:
     signals: dict[str, float]
     unexplained: tuple[Span, ...]
     """Runs no stage explained. Empty is the goal."""
+    street_type_substituted: TypeSubstitution | None = None
+    """Set when the matched street's type is not the one the input asked for.
+
+    None whenever the type agreed, so a caller can treat presence as the signal.
+    The score already carries TYPE_MISMATCH_PENALTY; this says what was
+    substituted, so a caller can cap confidence and name it in a response rather
+    than reporting a street the input did not quite ask for in silence."""
 
     @property
     def granularity(self) -> str:
@@ -694,6 +722,7 @@ def resolve_streets(
         leftover = ts.runs(street_claimed)
 
         parts = dict(h.signals)
+        substitution: TypeSubstitution | None = None
         if best is not None:
             parts["street_match"] = weights.street_match_weight * best.match_score
             if best.type_mismatch:
@@ -701,6 +730,12 @@ def resolve_streets(
                 parts["street_type_mismatch"] = weights.type_mismatch_penalty
                 parts["street_match"] -= weights.type_mismatch_penalty * (
                     weights.street_match_weight
+                )
+                type_word = ts.slice(best.span)[-1].text
+                substitution = TypeSubstitution(
+                    written_as=type_word,
+                    input_type=next(iter(sorted(codes_for_token(type_word))), ""),
+                    matched_type=best.row.street_type,
                 )
         n_left = sum(len(s) for s in leftover)
         if n_left:
@@ -713,6 +748,7 @@ def resolve_streets(
                 score=sum(parts.values()),
                 signals=parts,
                 unexplained=leftover,
+                street_type_substituted=substitution,
             )
         )
 

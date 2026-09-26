@@ -648,3 +648,92 @@ def test_nt_postcodes_keep_their_leading_zero() -> None:
 def test_an_unpadded_postcode_is_padded_on_the_way_in() -> None:
     """A caller that went through an int arrives with '800'."""
     assert streets_for(("NT", "DARWIN CITY", "800")) == streets_for(("NT", "DARWIN CITY", "0800"))
+
+
+# ---------------------------------------------------------------------------
+# street_type_substituted
+# ---------------------------------------------------------------------------
+
+
+def _carrum_downs_hyp() -> Hypothesis:
+    return _hyp(
+        "CARRUM DOWNS",
+        "VIC",
+        "3201",
+        address_count=13079,
+        locality_span=Span(0, 0),
+        postcode_span=Span(3, 4),
+        score=2.09,
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "street_key", "written", "code", "matched"),
+    [
+        ("12 Clifton Street 3201", "CLIFTON GR", "STREET", "ST", "GR"),
+        ("12 Clifton St 3201", "CLIFTON GR", "ST", "ST", "GR"),
+        ("12 Richmond Road 3201", "RICHMOND AV", "ROAD", "RD", "AV"),
+        ("12 Hall Street 3201", "HALL RD", "STREET", "ST", "RD"),
+    ],
+)
+def test_substitution_records_the_input_and_matched_types(
+    raw: str, street_key: str, written: str, code: str, matched: str
+) -> None:
+    ts = tokenize(raw)
+    res = resolve_streets(ts, [_carrum_downs_hyp()], consumed=[Span(0, 1)], source=fixture_source)
+    top = res[0]
+    assert top.street is not None and top.street.street_key == street_key
+    sub = top.street_type_substituted
+    assert sub is not None
+    assert (sub.written_as, sub.input_type, sub.matched_type) == (written, code, matched)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "12 Clifton Park Drive 3201",  # type agreed
+        "12 Clifton Park Dr 3201",  # type agreed, abbreviated
+        "12 Woolloomooloo Street 3201",  # no street matched at all
+    ],
+)
+def test_no_substitution_when_the_type_agreed_or_nothing_matched(raw: str) -> None:
+    """None is the signal, so a caller can test presence rather than a flag."""
+    ts = tokenize(raw)
+    res = resolve_streets(ts, [_carrum_downs_hyp()], consumed=[Span(0, 1)], source=fixture_source)
+    assert res[0].street_type_substituted is None
+
+
+def test_substitution_tracks_the_type_mismatch_flag_exactly() -> None:
+    """The field and the penalty must never disagree about what happened."""
+    for raw in [
+        "12 Clifton Street 3201",
+        "12 Clifton Park Drive 3201",
+        "12 Hall Road 3201",
+        "12 Woolloomooloo Street 3201",
+    ]:
+        ts = tokenize(raw)
+        top = resolve_streets(
+            ts, [_carrum_downs_hyp()], consumed=[Span(0, 1)], source=fixture_source
+        )[0]
+        mismatched = top.street is not None and top.street.type_mismatch
+        assert (top.street_type_substituted is not None) is mismatched, raw
+        assert ("street_type_mismatch" in top.signals) is mismatched, raw
+
+
+def test_a_typeless_street_reports_a_blank_matched_type() -> None:
+    """THE HORSLEY DRIVE has no type, so nothing can be substituted for it."""
+    ts = tokenize("The Horsley Drive")
+    hyps = [_hyp("SMITHFIELD", "NSW", "2164", locality_span=Span(0, 0))]
+    top = resolve_streets(ts, hyps, source=fixture_source)[0]
+    assert top.street is not None and top.street.row.street_type == ""
+    assert top.street_type_substituted is None
+
+
+def test_substitution_does_not_change_the_score() -> None:
+    """Adding the field is reporting only: the penalty was already in the score."""
+    ts = tokenize("12 Clifton Street 3201")
+    top = resolve_streets(ts, [_carrum_downs_hyp()], consumed=[Span(0, 1)], source=fixture_source)[
+        0
+    ]
+    assert top.score == pytest.approx(sum(top.signals.values()))
+    assert top.signals["street_type_mismatch"] == scoring.TYPE_MISMATCH_PENALTY
