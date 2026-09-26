@@ -5,6 +5,8 @@
 #   sudo -u locatron /opt/locatron/app/deploy/deploy.sh
 #   /opt/locatron/app/deploy/deploy.sh --branch dev
 #   /opt/locatron/app/deploy/deploy.sh --skip-tests
+#   /opt/locatron/app/deploy/deploy.sh --no-config
+#   /opt/locatron/app/deploy/deploy.sh --config-only
 #
 # Assumes deploy/install.sh has already run. If the checkout or venv does not
 # exist yet, run install.sh instead.
@@ -14,6 +16,10 @@
 # break the next run as locatron.
 #
 # Fully non-interactive. Nothing here prompts.
+#
+# Installs deploy/systemd/locatron-*.service and deploy/nginx.conf whenever they
+# differ from what is live, before anything is restarted. --no-config skips that
+# step; --config-only runs only that step and touches no code.
 #
 # Roll back: the previous commit is printed at the end.
 #     git -C /opt/locatron/app reset --hard <sha>
@@ -27,18 +33,32 @@ VENV="${LOCATRON_VENV:-/opt/locatron/venv}"
 ENV_FILE="${LOCATRON_ENV_FILE:-/opt/locatron/.env}"
 BRANCH="${LOCATRON_BRANCH:-main}"
 
+# Where the config files go. Overridable so the test suite can point them at a
+# scratch directory instead of /etc.
+SYSTEMD_DIR="${LOCATRON_SYSTEMD_DIR:-/etc/systemd/system}"
+NGINX_SITE="${LOCATRON_NGINX_SITE:-/etc/nginx/sites-available/locatron}"
+
 SKIP_TESTS=0
 FORCE=0
+NO_CONFIG=0
+CONFIG_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --branch)     BRANCH="$2"; shift 2 ;;
-        --skip-tests) SKIP_TESTS=1; shift ;;
-        --force)      FORCE=1; shift ;;
-        -h|--help)    sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *)            echo "unknown option: $1" >&2; exit 1 ;;
+        --branch)      BRANCH="$2"; shift 2 ;;
+        --skip-tests)  SKIP_TESTS=1; shift ;;
+        --force)       FORCE=1; shift ;;
+        --no-config)   NO_CONFIG=1; shift ;;
+        --config-only) CONFIG_ONLY=1; shift ;;
+        -h|--help)     sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *)             echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+if (( NO_CONFIG && CONFIG_ONLY )); then
+    echo "--no-config and --config-only are mutually exclusive" >&2
+    exit 1
+fi
 
 say()  { printf '\n==> %s\n' "$1"; }
 info() { printf '    %s\n' "$1"; }
@@ -53,6 +73,143 @@ else
     as_app() { "$@"; }
     SUDO="sudo"
     CTX="running as $(id -un)"
+fi
+
+# ---------------------------------------------------------------------------
+# Config file installation.
+#
+# deploy.sh used to deploy Python code only, so the unit files and nginx.conf
+# were installed by hand and drifted from the repo. The ordering was the
+# expensive part: restart a service while the old unit is still in place and a
+# bug you have already fixed looks like it persisted.
+#
+# Every install here is conditional on the file actually differing, so a
+# code-only deploy costs a couple of cmp calls and reloads nothing.
+
+# Recover the live shared secret from an installed nginx config.
+#
+# The repo copy carries REPLACE_ME where the installed one carries a real
+# value, so installing the repo copy verbatim would make nginx reject every
+# request the edge forwards. Echoes nothing when there is no secret to recover.
+recover_secret() {
+    local file="$1" found=""
+    [[ -f "$file" ]] || return 0
+    found=$(grep -oP 'http_x_locatron_edge != "\K[^"]+' "$file" 2>/dev/null | head -n1) || true
+    if [[ "$found" == "REPLACE_ME" ]]; then
+        found=""
+    fi
+    printf '%s' "$found"
+}
+
+install_units() {
+    local changed=0 src name dest
+    for src in "$APP_DIR"/deploy/systemd/locatron-*.service; do
+        [[ -f "$src" ]] || continue
+        name=$(basename "$src")
+        dest="$SYSTEMD_DIR/$name"
+
+        # cmp is non-zero when dest is missing too, which is the right answer.
+        if cmp -s "$src" "$dest"; then
+            info "$name unchanged"
+            continue
+        fi
+        $SUDO install -m 0644 "$src" "$dest"
+        info "$name installed"
+        changed=1
+    done
+
+    # One reload covers every unit, and only if something actually changed.
+    if (( changed )); then
+        $SUDO systemctl daemon-reload
+        info "systemctl daemon-reload"
+    fi
+}
+
+install_nginx() {
+    local src="$APP_DIR/deploy/nginx.conf"
+    local staged backup="" recovered test_out rc=0
+
+    if [[ ! -f "$src" ]]; then
+        info "deploy/nginx.conf missing from the repo, skipped"
+        return 0
+    fi
+
+    staged=$(mktemp)
+    recovered=$(recover_secret "$NGINX_SITE")
+
+    if [[ -n "$recovered" ]]; then
+        # Validated before it reaches sed: a secret containing & or / would
+        # otherwise corrupt the substitution rather than fail it.
+        if [[ ! "$recovered" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+            rm -f "$staged"
+            die "the shared secret in $NGINX_SITE contains unexpected characters, refusing to substitute it"
+        fi
+        sed "s/REPLACE_ME/$recovered/g" "$src" > "$staged"
+    else
+        cat "$src" > "$staged"
+    fi
+
+    # Writing the placeholder into the live config would reject all edge
+    # traffic with a 444, which looks exactly like an application outage.
+    if grep -q REPLACE_ME "$staged"; then
+        rm -f "$staged"
+        die "no shared secret to recover from $NGINX_SITE, and deploy/nginx.conf still has REPLACE_ME.
+    Set a secret in the installed config first:
+        openssl rand -hex 32
+    Refusing to write REPLACE_ME into the live config."
+    fi
+
+    if cmp -s "$staged" "$NGINX_SITE"; then
+        rm -f "$staged"
+        info "nginx.conf unchanged"
+        return 0
+    fi
+
+    if [[ -f "$NGINX_SITE" ]]; then
+        backup=$(mktemp)
+        cat "$NGINX_SITE" > "$backup"
+    fi
+
+    $SUDO install -m 0644 "$staged" "$NGINX_SITE"
+    rm -f "$staged"
+    info "nginx.conf installed"
+
+    # Capture the output before restoring, or the failure we print is the test
+    # of the config we just put back rather than the one that broke.
+    test_out=$($SUDO nginx -t 2>&1) || rc=$?
+    if (( rc == 0 )); then
+        $SUDO systemctl reload nginx
+        info "nginx reloaded"
+        rm -f "$backup"
+        return 0
+    fi
+
+    printf '%s\n' "$test_out" | sed 's/^/      /'
+    info "nginx -t failed, restoring the previous config"
+
+    if [[ -n "$backup" ]]; then
+        $SUDO install -m 0644 "$backup" "$NGINX_SITE"
+        rm -f "$backup"
+    else
+        # Nothing was there before, so removing it is the restore.
+        $SUDO rm -f "$NGINX_SITE"
+    fi
+    $SUDO systemctl reload nginx || true
+
+    die "deploy/nginx.conf failed nginx -t. The previous config is back in place and nginx was reloaded"
+}
+
+install_config() {
+    install_units
+    install_nginx
+}
+
+if (( CONFIG_ONLY )); then
+    say "Installing config files"
+    info "$CTX"
+    install_config
+    printf '\nConfig step complete, no code deployed\n\n'
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------
@@ -135,6 +292,19 @@ if [[ -x "$VENV/bin/locatron" ]]; then
     as_app "$VENV/bin/locatron" check || die "locatron check failed, see above"
 else
     info "locatron entry point not installed, skipped"
+fi
+
+# ---------------------------------------------------------------------------
+#
+# Before the restart, not after. A restart that picks up the old unit file
+# makes an already-fixed bug look like it is still there.
+
+say "Installing config files"
+
+if (( NO_CONFIG )); then
+    info "skipped (--no-config)"
+else
+    install_config
 fi
 
 # ---------------------------------------------------------------------------
