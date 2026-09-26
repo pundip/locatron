@@ -152,16 +152,33 @@ Deploy:
 # On the container, as root
 bash /opt/locatron/app/deploy/deploy.sh --branch master
 ```
-It fetches, installs dependencies, runs tests, runs `locatron check`, installs
-changed systemd and nginx files, then restarts services. `deploy/install.sh` is
-for first-time setup or repair only.
-Useful CLI, all run from the repo root:
+It fetches, installs dependencies, builds the SQLite street mirror if it is
+missing or stale, runs tests, runs `locatron check`, installs changed systemd and
+nginx files, then restarts services. `deploy/install.sh` is for first-time setup
+or repair only.
+On the container, CLI commands go through `deploy/lc.sh`. Never a bare `uv run` as
+root:
+```bash
+/opt/locatron/app/deploy/lc.sh check
+/opt/locatron/app/deploy/lc.sh check --deep     # adds the full mirror digest
+/opt/locatron/app/deploy/lc.sh build streets
+/opt/locatron/app/deploy/lc.sh parse "65 clifton park drive 3201 carrum downs"
+```
+`lc.sh` reproduces exactly the environment deploy.sh uses — same venv, same env
+file, same user, same working directory — so a command run by hand behaves the way
+it behaves during a deploy. Running `uv run locatron ...` as root in
+`/opt/locatron/app` instead leaves root-owned files behind: uv creates a `.venv`
+next to the project when it cannot find the configured interpreter, and the next
+deploy runs as `locatron`, cannot write it, and fails somewhere unrelated to the
+cause. That has happened once already.
+On Windows, from the repo root, the bare CLI is fine:
 ```bash
 uv run locatron check                  # config and database health
 uv run locatron schema                 # inspect table structure
 uv run locatron sample Cities -n 5     # see real values, not just types
 uv run locatron norm "Greater Melbourne"
 uv run locatron resolve "Greater Melbourne"
+uv run locatron parse "12 Clifton Street 3201"
 uv run locatron golden                 # accuracy against the golden set
 ```
 `locatron schema` and `locatron sample` exist specifically so Claude Code
