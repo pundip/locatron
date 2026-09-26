@@ -18,9 +18,10 @@ import pytest
 from locatron.parse.components import (
     find_po_boxes,
     find_postcodes,
+    find_street_numbers,
     find_units_and_levels,
 )
-from locatron.parse.tokens import tokenize
+from locatron.parse.tokens import Span, tokenize
 
 GOLDEN = Path(__file__).resolve().parent.parent / "golden" / "golden.csv"
 
@@ -396,3 +397,194 @@ def test_slash_form_consumes_only_its_own_token() -> None:
         "VIC",
         "3065",
     )
+
+
+# ---------------------------------------------------------------------------
+# street numbers
+# ---------------------------------------------------------------------------
+
+#: Every golden row -> (number_first, number_last, from_slash) candidates.
+#: Four-digit postcodes appear here too, deliberately: '3201' is a street number
+#: shape as well as a postcode, and only the gazetteer can say which.
+EXPECTED_NUMBERS: dict[str, list[tuple[str, str | None, bool]]] = {
+    "65 clifton park drive 3201 carrum downs": [("65", None, False), ("3201", None, False)],
+    "65 Clifton Park Dr Carrum Downs VIC 3201": [("65", None, False), ("3201", None, False)],
+    "5/12 Smith Street Fitzroy VIC 3065": [("12", None, True), ("3065", None, False)],
+    "Unit 5 12 Smith Street Fitzroy 3065": [
+        ("5", None, False),
+        ("12", None, False),
+        ("3065", None, False),
+    ],
+    "14-40 Wills Street Melbourne VIC 3000": [("14", "40", False), ("3000", None, False)],
+    "3201": [("3201", None, False)],
+    "PO Box 45 World Square NSW 2002": [("45", None, False), ("2002", None, False)],
+    "Ryde NSW 2112": [("2112", None, False)],
+    "Hamilton Crescent Ryde NSW 2112": [("2112", None, False)],
+}
+
+
+@pytest.mark.parametrize("raw", ALL_INPUTS)
+def test_street_numbers_in_every_golden_row(raw: str) -> None:
+    got = [
+        (n.number_first, n.number_last, n.from_slash) for n in find_street_numbers(tokenize(raw))
+    ]
+    assert got == EXPECTED_NUMBERS.get(raw, [])
+
+
+@pytest.mark.parametrize(
+    ("raw", "first"),
+    [
+        ("65", "65"),
+        ("65 Smith St", "65"),
+        ("1", "1"),
+        ("123456", "123456"),
+        # Alpha suffix stays inside number_first, as address_ref stores it.
+        ("6C", "6C"),
+        ("59B Moynihan St", "59B"),
+        ("12A", "12A"),
+        ("1A", "1A"),
+    ],
+)
+def test_single_numbers(raw: str, first: str) -> None:
+    n = find_street_numbers(tokenize(raw))[0]
+    assert (n.number_first, n.number_last) == (first, None)
+    assert n.is_range is False
+    assert n.from_slash is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "first", "last"),
+    [
+        ("14-40", "14", "40"),
+        ("14-40 Wills Street", "14", "40"),
+        ("100-104", "100", "104"),
+        ("1-3", "1", "3"),
+        # Suffixes on both ends of a range.
+        ("1A-1C", "1A", "1C"),
+        ("6C-8", "6C", "8"),
+        ("8-10B", "8", "10B"),
+    ],
+)
+def test_ranges(raw: str, first: str, last: str) -> None:
+    n = find_street_numbers(tokenize(raw))[0]
+    assert (n.number_first, n.number_last) == (first, last)
+    assert n.is_range is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "first", "last"),
+    [
+        ("5/12", "12", None),
+        ("5/12 Smith Street", "12", None),
+        ("12A/34", "34", None),
+        # The right of the slash may be a range.
+        ("1/14-40", "14", "40"),
+        ("2/6C", "6C", None),
+    ],
+)
+def test_numbers_from_the_slash_form(raw: str, first: str, last: str | None) -> None:
+    n = find_street_numbers(tokenize(raw))[0]
+    assert (n.number_first, n.number_last) == (first, last)
+    assert n.from_slash is True
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        # The case a looser range pattern would break: hyphens survive
+        # normalisation, so the locality arrives here intact.
+        "Ku-ring-gai NSW",
+        "Ku-ring-gai",
+        "KUR-RING-GAI",
+        "St Kilda East VIC",
+        "Clifton Park Drive Carrum Downs",
+        "Carrum Downs VIC",
+        "SMITH",
+        "VIC",
+        "Australia",
+        "",
+        "/",
+        "Remote / Work from home",
+        # Not number-shaped on both sides of the hyphen.
+        "A-1",
+        "1-B",
+        "ONE-TWO",
+        # Too many digits to be a street number.
+        "1234567",
+        # A letter-led unit value is not a street number.
+        "G01",
+    ],
+)
+def test_not_a_street_number(raw: str) -> None:
+    assert find_street_numbers(tokenize(raw)) == ()
+
+
+def test_hyphenated_locality_is_never_a_range() -> None:
+    """The single most likely way to break this extractor."""
+    assert find_street_numbers(tokenize("Ku-ring-gai NSW")) == ()
+    assert find_street_numbers(tokenize("14-40 Ku-ring-gai Road"))[0].number_last == "40"
+
+
+def test_range_and_single_are_distinguishable() -> None:
+    (rng,) = find_street_numbers(tokenize("14-40"))
+    (single,) = find_street_numbers(tokenize("6C"))
+    assert rng.is_range and rng.number_last == "40"
+    assert not single.is_range and single.number_last is None
+
+
+def test_span_points_at_the_number_token() -> None:
+    ts = tokenize("65 CLIFTON PARK DRIVE")
+    (n,) = find_street_numbers(ts)
+    assert ts.text_of(n.span) == "65"
+    assert tuple(t.text for t in ts.remaining([n.span])) == ("CLIFTON", "PARK", "DRIVE")
+
+
+def test_slash_span_is_the_whole_token_shared_with_the_unit() -> None:
+    """One token satisfies two components, so both spans are the same token."""
+    ts = tokenize("5/12 Smith Street")
+    (u,) = find_units_and_levels(ts)
+    (n,) = find_street_numbers(ts)
+    assert u.span == n.span
+    assert ts.text_of(n.span) == "5/12"
+    assert n.from_slash is True
+
+
+# ---------------------------------------------------------------------------
+# the extractors together
+# ---------------------------------------------------------------------------
+
+
+def test_worked_example_leaves_the_street_behind() -> None:
+    """CLAUDE.md's worked example. With the number, postcode and locality
+    claimed, CLIFTON PARK DRIVE comes back as one run."""
+    ts = tokenize("65 clifton park drive 3201 carrum downs")
+    number = find_street_numbers(ts)[0]
+    postcode = find_postcodes(ts)[0]
+    assert ts.text_of(number.span) == "65"
+    assert ts.text_of(postcode.span) == "3201"
+    # The locality span is the gazetteer's job; stand in for it here.
+    locality = Span(5, 7)
+    runs = ts.runs([number.span, postcode.span, locality])
+    assert runs == (Span(1, 4),)
+    assert ts.text_of(runs[0]) == "CLIFTON PARK DRIVE"
+
+
+def test_spelled_unit_row_yields_unit_number_and_postcode() -> None:
+    ts = tokenize("Unit 5 12 Smith Street Fitzroy 3065")
+    (unit,) = find_units_and_levels(ts)
+    numbers = find_street_numbers(ts)
+    (postcode,) = find_postcodes(ts)
+    assert (unit.value, unit.keyword) == ("5", "UNIT")
+    # The 5 inside 'UNIT 5' is also number-shaped, so it is proposed too. The
+    # scorer prefers the reading where the unit keyword claims it.
+    assert [n.number_first for n in numbers] == ["5", "12", "3065"]
+    assert postcode.postcode == "3065"
+    street = ts.runs([unit.span, Span(2, 3), postcode.span, Span(5, 6)])
+    assert ts.text_of(street[0]) == "SMITH STREET"
+
+
+def test_po_box_row_yields_no_street_number_once_the_box_is_claimed() -> None:
+    ts = tokenize("PO Box 45 World Square NSW 2002")
+    (box,) = find_po_boxes(ts)
+    left = [n for n in find_street_numbers(ts) if not n.span.overlaps(box.span)]
+    assert [n.number_first for n in left] == ["2002"]

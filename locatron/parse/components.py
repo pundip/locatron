@@ -243,3 +243,93 @@ def find_units_and_levels(ts: TokenStream) -> tuple[UnitLevel, ...]:
             )
 
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# street number
+# ---------------------------------------------------------------------------
+
+#: A single number, suffix included. G-NAF stores '59B' in NUMBER_FIRST with
+#: NUMBER_LAST blank, so the suffix belongs inside number_first here too rather
+#: than in a field of its own.
+_SINGLE_RE = re.compile(rf"^({_NUMBER})$")
+
+#: A range: '14-40', and with suffixes '1A-1C'. Both sides must be
+#: number-shaped, which is what keeps 'KU-RING-GAI' out. Hyphens survive
+#: normalisation, so a hyphenated locality reaches this function intact and a
+#: looser pattern would eat it.
+_RANGE_RE = re.compile(rf"^({_NUMBER})-({_NUMBER})$")
+
+
+@dataclass(frozen=True, slots=True)
+class StreetNumber:
+    """A street number candidate, shaped the way address_ref stores it."""
+
+    number_first: str
+    """Suffix included: '65', '6C'. Maps to NUMBER_FIRST."""
+    span: Span
+    number_last: str | None = None
+    """Set only for a range. Maps to NUMBER_LAST, which is blank otherwise."""
+    from_slash: bool = False
+    """True when taken from the right of a slash, as the 12 in '5/12'. The unit
+    extractor proposes the same token, so a caller that consumes both must
+    expect one token to satisfy two components."""
+
+    @property
+    def is_range(self) -> bool:
+        return self.number_last is not None
+
+
+def _parse_number(text: str) -> tuple[str, str | None] | None:
+    """(number_first, number_last) for a number-shaped token, else None."""
+    single = _SINGLE_RE.match(text)
+    if single:
+        return single.group(1), None
+    rng = _RANGE_RE.match(text)
+    if rng:
+        return rng.group(1), rng.group(2)
+    return None
+
+
+def find_street_numbers(ts: TokenStream) -> tuple[StreetNumber, ...]:
+    """Every street number candidate, in token order.
+
+    Unvalidated, like the rest: a four-digit token is both a postcode and a
+    plausible street number, and '3201' on its own is a golden row that means
+    the postcode. Deciding needs the gazetteer.
+
+    >>> from locatron.parse.tokens import tokenize
+    >>> [(n.number_first, n.number_last) for n in find_street_numbers(tokenize("65 Smith St"))]
+    [('65', None)]
+    >>> [(n.number_first, n.number_last)
+    ...  for n in find_street_numbers(tokenize("14-40 Wills Street"))]
+    [('14', '40')]
+    >>> [(n.number_first, n.number_last) for n in find_street_numbers(tokenize("6C Smith St"))]
+    [('6C', None)]
+    """
+    out: list[StreetNumber] = []
+
+    for token in ts:
+        parsed = _parse_number(token.text)
+        if parsed is not None:
+            first, last = parsed
+            out.append(StreetNumber(number_first=first, span=token.span, number_last=last))
+            continue
+
+        # '5/12' and '1/14-40': the street number is whatever is right of the
+        # slash. Reported against the same token the unit came from.
+        slash = _SLASH_RE.match(token.text)
+        if slash:
+            parsed = _parse_number(slash.group(2))
+            if parsed is not None:
+                first, last = parsed
+                out.append(
+                    StreetNumber(
+                        number_first=first,
+                        span=token.span,
+                        number_last=last,
+                        from_slash=True,
+                    )
+                )
+
+    return tuple(out)
