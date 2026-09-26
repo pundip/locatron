@@ -407,12 +407,71 @@ def _extract_components(ts, known_postcodes):
         for n in find_street_numbers(ts)
         if n.span.start not in four_digit_starts
         and (
-            not any(n.span.overlaps(s) for s in claimed)
-            or (n.from_slash and n.span in slash_spans)
+            not any(n.span.overlaps(s) for s in claimed) or (n.from_slash and n.span in slash_spans)
         )
     ]
     claimed += [n.span for n in numbers]
     return boxes, units, postcodes, numbers, claimed
+
+
+def _token_roles(ts, winner, boxes, units, postcodes, numbers) -> list[str]:
+    """One role per token, resolved against the winning hypothesis.
+
+    The extractors deliberately propose overlapping readings -- a three-digit
+    token is a padded postcode candidate *and* a street number candidate, and
+    only the winner settles which it is. Reporting both left '800' looking like
+    Darwin's postcode and a house number at the same time.
+
+    The winner's own spans decide. Its postcode_span is set only when the
+    postcode actually scored, so a padded candidate nothing agreed with leaves
+    the token free for the number role, which is what '810 Stuart Highway
+    Winnellie' needs.
+
+    The one token that genuinely holds two roles is the slash form: '5/12' is a
+    unit and a street number in one token, which is the whole point of writing it
+    that way. It is labelled as such rather than forced to pick.
+    """
+    roles: dict[int, str] = {}
+
+    def claim(span, role: str) -> None:
+        for i in span.indices:
+            roles.setdefault(i, role)
+
+    street_span = winner.street.span if winner.street is not None else None
+    pc_span = winner.locality.postcode_span
+
+    # Highest confidence first: whatever the winner actually used.
+    if street_span is not None:
+        claim(street_span, "street")
+    if len(winner.locality.locality_span):
+        claim(winner.locality.locality_span, "locality")
+    if winner.locality.state_span is not None:
+        claim(winner.locality.state_span, "state")
+    if pc_span is not None:
+        value = next((c.postcode for c in postcodes if c.span == pc_span), "")
+        claim(pc_span, f"postcode {value}")
+
+    for b in boxes:
+        claim(b.span, f"po box {b.kind} {b.number}")
+
+    slash_spans = {u.span for u in units if u.street_number_hint}
+    for u in units:
+        if u.span in slash_spans:
+            hint = u.street_number_hint
+            claim(u.span, f"unit {u.value} + number {hint}")
+        else:
+            claim(u.span, f"{u.kind} {u.value}")
+
+    for n in numbers:
+        # A token the winner used as the postcode is not also the number.
+        if pc_span is not None and n.span == pc_span:
+            continue
+        claim(n.span, f"number {n.number_first}")
+
+    lines = ["roles (winner)"]
+    for t in ts:
+        lines.append(f"  {t.index}  {t.text:<16}{roles.get(t.index, 'unexplained')}")
+    return lines
 
 
 def _parse_one(text_in: str, au, known_postcodes) -> list[str]:
@@ -426,7 +485,7 @@ def _parse_one(text_in: str, au, known_postcodes) -> list[str]:
 
     out = [f"input      {text_in!r}", f"tokens     {list(ts.texts)}"]
 
-    out.append("components")
+    out.append("components (candidates)")
     out.append(
         "  postcodes  "
         + (
@@ -493,6 +552,7 @@ def _parse_one(text_in: str, au, known_postcodes) -> list[str]:
         out.append(f"       unexplained  {left or '-'}")
 
     top = joint[0]
+    out.extend(_token_roles(ts, top, boxes, units, postcodes, numbers))
     out.append("breakdown (top)")
     listed = [k for k in _SIGNAL_ORDER if k in top.signals]
     extra = sorted(k for k in top.signals if k not in _SIGNAL_ORDER)

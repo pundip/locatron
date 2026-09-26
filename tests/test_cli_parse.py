@@ -127,3 +127,61 @@ def test_both_unit_forms_report_the_same_unit_and_number() -> None:
     # The slash form says where its number came from.
     assert "12 (from /)" in slash.output
     assert "(from /)" not in spelled.output
+
+
+def _roles(output: str) -> dict[str, str]:
+    """token -> role, from the roles section of one report block."""
+    lines = output.splitlines()
+    start = lines.index("roles (winner)") + 1
+    out: dict[str, str] = {}
+    for line in lines[start:]:
+        if not line.startswith("  ") or line.startswith("  =") or not line[2:3].isdigit():
+            break
+        _index, token, role = line.strip().split(None, 2)
+        out[token] = role
+    return out
+
+
+@needs_stores
+@pytest.mark.parametrize(
+    ("raw", "token", "role"),
+    [
+        # The padded postcode takes the token, so it is not also the number.
+        ("800", "800", "postcode 0800"),
+        ("200", "200", "postcode 0200"),
+        ("Darwin NT 800", "800", "postcode 0800"),
+        # ...and where nothing agreed with 0810, the token stays the number.
+        ("810 Stuart Highway Winnellie", "810", "number 810"),
+    ],
+)
+def test_a_three_digit_token_holds_one_role_not_two(raw: str, token: str, role: str) -> None:
+    result = runner.invoke(app, ["parse", raw])
+    assert result.exit_code == 0, result.output
+    assert _roles(result.output)[token] == role
+
+
+@needs_stores
+def test_every_token_gets_exactly_one_role() -> None:
+    for raw in [
+        "65 clifton park drive 3201 carrum downs",
+        "Darwin NT 800",
+        "810 Stuart Highway Winnellie",
+        "PO Box 45 World Square NSW 2002",
+        "12 Clifton Street 3201",
+    ]:
+        result = runner.invoke(app, ["parse", raw])
+        assert result.exit_code == 0, result.output
+        roles = _roles(result.output)
+        tokens = [ln for ln in result.output.splitlines() if ln.startswith("tokens ")][0]
+        # One line per token, and every one of them names a role.
+        assert len(roles) == tokens.count("'") // 2, (raw, roles)
+        assert all(v for v in roles.values()), (raw, roles)
+
+
+@needs_stores
+def test_the_slash_token_is_labelled_as_the_compound_it_is() -> None:
+    """'5/12' really does hold a unit and a number. It says so rather than
+    picking one, which would lose information the form carries."""
+    result = runner.invoke(app, ["parse", "5/12 Smith Street Fitzroy VIC 3065"])
+    assert result.exit_code == 0, result.output
+    assert _roles(result.output)["5/12"] == "unit 5 + number 12"
