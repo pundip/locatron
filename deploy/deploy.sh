@@ -290,8 +290,17 @@ as_app chmod +x "$APP_DIR"/deploy/*.sh 2>/dev/null || true
 
 say "Installing dependencies"
 
-as_app uv pip install --python "$VENV/bin/python" --quiet -e "$APP_DIR[export]"
-info "done"
+# The dev extra carries pytest, and the test step below needs it in this venv.
+# There is no CI on this project, so the deploy is the only thing that ever runs
+# the suite -- skipping it because pytest happened to be absent meant nothing ran
+# the tests at all. --skip-tests keeps the extra out for a lean production venv.
+if (( SKIP_TESTS )); then
+    EXTRAS="export"
+else
+    EXTRAS="export,dev"
+fi
+as_app uv pip install --python "$VENV/bin/python" --quiet -e "$APP_DIR[$EXTRAS]"
+info "installed extras: $EXTRAS"
 
 # ---------------------------------------------------------------------------
 #
@@ -367,12 +376,17 @@ fi
 say "Running tests"
 
 if (( SKIP_TESTS )); then
-    info "skipped"
-elif as_app "$VENV/bin/python" -c 'import pytest' 2>/dev/null; then
+    info "skipped by --skip-tests"
+elif ! as_app "$VENV/bin/python" -c 'import pytest' 2>/dev/null; then
+    # This used to print "pytest not installed, skipped" and carry on, which is
+    # how the first deploy reported a pass it had never run. The install step
+    # above puts pytest in this venv, so if it is missing the venv is broken and
+    # that is worth stopping for.
+    die "pytest is not importable in $VENV despite the dev extra being installed.
+    Check the venv, or pass --skip-tests to deploy without running the suite."
+else
     as_app "$VENV/bin/python" -m pytest "$APP_DIR/tests" -q \
         || die "tests failed (override with --skip-tests)"
-else
-    info "pytest not installed, skipped"
 fi
 
 # ---------------------------------------------------------------------------
