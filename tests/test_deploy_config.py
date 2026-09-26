@@ -45,6 +45,9 @@ SYSD="$WORK/systemd"; mkdir -p "$SYSD"
 NGX="$WORK/nginx-site"
 export STUB_LOG="$WORK/calls.log"; : > "$STUB_LOG"
 
+# The deploy stages into TMPDIR; point it somewhere countable.
+export TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"
+
 cp "$REPO"/deploy/systemd/locatron-*.service "$APP/deploy/systemd/"
 cp "$REPO"/deploy/nginx.conf "$APP/deploy/"
 cp "$REPO"/deploy/deploy.sh  "$APP/deploy/"
@@ -57,6 +60,11 @@ chmod +x "$STUBS/sudo" "$STUBS/systemctl" "$STUBS/nginx"
 export PATH="$STUBS:$PATH"
 
 EDGE_VALUE=abc123def4567890
+
+# Anything the deploy staged and failed to clean up.
+leftover_tmp() {
+    find "$TMPDIR" -maxdepth 1 -name 'locatron-deploy.*' | wc -l | tr -d ' '
+}
 
 run_deploy() {
     LOCATRON_APP_DIR="$APP" \
@@ -252,3 +260,70 @@ report 0
     assert "no_config_parses=0" in out
     assert "mutually_exclusive=1" in out
     assert "unknown=1" in out
+
+
+def test_staging_is_cleaned_up_after_a_successful_install() -> None:
+    rc, out, _ = _run(
+        r"""
+put_in_sync
+echo "# drifted" >> "$NGX"
+rc=0; run_deploy --config-only || rc=$?
+echo "leftover=$(leftover_tmp)"
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "nginx.conf installed" in out
+    assert "leftover=0" in out, "staging file survived a successful run"
+
+
+def test_staging_is_cleaned_up_when_the_run_fails() -> None:
+    """The trap, not the happy path, is what has to remove these."""
+    rc, out, _ = _run(
+        r"""
+put_in_sync
+echo "# drifted" >> "$NGX"
+export STUB_NGINX_RC=1
+rc=0; run_deploy --config-only || rc=$?
+echo "leftover=$(leftover_tmp)"
+report "$rc"
+"""
+    )
+    assert rc != 0, "nginx -t failed, so the run must fail"
+    assert "leftover=0" in out, "staging file survived a failed run"
+
+
+def test_staging_is_cleaned_up_when_the_install_is_refused() -> None:
+    """The die() before any install must not leak its staging file either."""
+    rc, out, _ = _run(
+        r"""
+cp "$APP"/deploy/systemd/locatron-*.service "$SYSD/"
+rm -f "$NGX"
+rc=0; run_deploy --config-only || rc=$?
+echo "leftover=$(leftover_tmp)"
+report "$rc"
+"""
+    )
+    assert rc != 0
+    assert "Refusing to write REPLACE_ME" in out
+    assert "leftover=0" in out, "staging file survived a refused install"
+
+
+def test_nothing_is_staged_inside_the_nginx_config_directory() -> None:
+    """Staging must never land where nginx might read it."""
+    rc, out, _ = _run(
+        r"""
+mkdir -p "$WORK/nginx/sites-available" "$WORK/nginx/sites-enabled"
+NGX="$WORK/nginx/sites-available/locatron"
+put_in_sync
+echo "# drifted" >> "$NGX"
+rc=0; run_deploy --config-only || rc=$?
+echo "available=$(find "$WORK/nginx/sites-available" -type f | wc -l | tr -d ' ')"
+echo "enabled=$(find "$WORK/nginx/sites-enabled" -type f | wc -l | tr -d ' ')"
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    # Only the config itself, and nothing at all in sites-enabled.
+    assert "available=1" in out
+    assert "enabled=0" in out

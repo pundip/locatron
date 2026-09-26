@@ -85,6 +85,31 @@ fi
 #
 # Every install here is conditional on the file actually differing, so a
 # code-only deploy costs a couple of cmp calls and reloads nothing.
+#
+# Staging happens under TMPDIR (/tmp), never anywhere nginx reads. Putting a
+# work file in sites-available/ risks it being mistaken for the real config,
+# and one in sites-enabled/ would actually be loaded, since the stock
+# nginx.conf includes that directory by glob. The staged copy also carries the
+# shared secret in the clear, so it is 0600 by virtue of mktemp and removed on
+# the way out however the script exits.
+
+TMP_FILES=()
+
+cleanup_tmp() {
+    (( ${#TMP_FILES[@]} )) || return 0
+    rm -f "${TMP_FILES[@]}"
+}
+
+# EXIT alone would cover a die(), but not a Ctrl-C or a SIGTERM from a deploy
+# that gets killed part-way through.
+trap cleanup_tmp EXIT INT TERM
+
+# mktemp, registered for cleanup. Two statements rather than a function that
+# echoes the path, because $(...) would append to the array inside a subshell
+# and the trap would never learn about the file.
+new_tmp() {
+    mktemp "${TMPDIR:-/tmp}/locatron-deploy.XXXXXX"
+}
 
 # Recover the live shared secret from an installed nginx config.
 #
@@ -134,14 +159,14 @@ install_nginx() {
         return 0
     fi
 
-    staged=$(mktemp)
+    staged=$(new_tmp)
+    TMP_FILES+=("$staged")
     recovered=$(recover_secret "$NGINX_SITE")
 
     if [[ -n "$recovered" ]]; then
         # Validated before it reaches sed: a secret containing & or / would
         # otherwise corrupt the substitution rather than fail it.
         if [[ ! "$recovered" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
-            rm -f "$staged"
             die "the shared secret in $NGINX_SITE contains unexpected characters, refusing to substitute it"
         fi
         sed "s/REPLACE_ME/$recovered/g" "$src" > "$staged"
@@ -152,7 +177,6 @@ install_nginx() {
     # Writing the placeholder into the live config would reject all edge
     # traffic with a 444, which looks exactly like an application outage.
     if grep -q REPLACE_ME "$staged"; then
-        rm -f "$staged"
         die "no shared secret to recover from $NGINX_SITE, and deploy/nginx.conf still has REPLACE_ME.
     Set a secret in the installed config first:
         openssl rand -hex 32
@@ -160,18 +184,17 @@ install_nginx() {
     fi
 
     if cmp -s "$staged" "$NGINX_SITE"; then
-        rm -f "$staged"
         info "nginx.conf unchanged"
         return 0
     fi
 
     if [[ -f "$NGINX_SITE" ]]; then
-        backup=$(mktemp)
+        backup=$(new_tmp)
+        TMP_FILES+=("$backup")
         cat "$NGINX_SITE" > "$backup"
     fi
 
     $SUDO install -m 0644 "$staged" "$NGINX_SITE"
-    rm -f "$staged"
     info "nginx.conf installed"
 
     # Capture the output before restoring, or the failure we print is the test
@@ -180,7 +203,6 @@ install_nginx() {
     if (( rc == 0 )); then
         $SUDO systemctl reload nginx
         info "nginx reloaded"
-        rm -f "$backup"
         return 0
     fi
 
@@ -189,7 +211,6 @@ install_nginx() {
 
     if [[ -n "$backup" ]]; then
         $SUDO install -m 0644 "$backup" "$NGINX_SITE"
-        rm -f "$backup"
     else
         # Nothing was there before, so removing it is the restore.
         $SUDO rm -f "$NGINX_SITE"
