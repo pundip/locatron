@@ -48,6 +48,25 @@ def _db_available() -> bool:
 
 needs_db = pytest.mark.skipif(not _db_available(), reason="ReferenceDB unreachable")
 
+
+def _mirror_available() -> bool:
+    try:
+        from locatron.db import local
+
+        local.read_meta()
+        return True
+    except Exception:
+        return False
+
+
+#: The store tests read the SQLite mirror, not MySQL. Before the seam moved,
+#: `needs_db` happened to describe their precondition; now it describes a
+#: different service entirely, and a missing mirror would fail them rather than
+#: skip them.
+needs_mirror = pytest.mark.skipif(
+    not _mirror_available(), reason="street mirror not built (locatron build streets)"
+)
+
 #: Span is frozen, so one shared default is safe to reuse across calls.
 _FIRST_TOKEN = Span(0, 1)
 
@@ -600,7 +619,7 @@ def test_the_source_is_called_once_for_all_hypotheses() -> None:
 # ---------------------------------------------------------------------------
 
 
-@needs_db
+@needs_mirror
 def test_fixture_matches_the_database() -> None:
     """The fixture is only useful while it is faithful."""
     fetched = streets_for_many(list(FIXTURE))
@@ -612,7 +631,7 @@ def test_fixture_matches_the_database() -> None:
             assert (got.street_name, got.street_type) == (row.street_name, row.street_type), key
 
 
-@needs_db
+@needs_mirror
 def test_streets_for_many_batches_and_keys_every_result() -> None:
     keys = [("VIC", "CARRUM DOWNS", "3201"), ("NSW", "RYDE", "2112")]
     got = streets_for_many(keys)
@@ -621,30 +640,29 @@ def test_streets_for_many_batches_and_keys_every_result() -> None:
     assert len(got[keys[0]]) > 100
 
 
-@needs_db
+@needs_mirror
 def test_streets_for_is_the_single_key_form() -> None:
     key = ("NSW", "RYDE", "2112")
     assert streets_for(key) == streets_for_many([key])[key]
 
 
-@needs_db
+@needs_mirror
 def test_streets_for_an_unknown_locality_is_empty() -> None:
     assert streets_for(("VIC", "NOWHERE AT ALL", "9999")) == ()
 
 
-@needs_db
 def test_streets_for_many_with_no_keys_makes_no_query() -> None:
     assert streets_for_many([]) == {}
 
 
-@needs_db
+@needs_mirror
 def test_nt_postcodes_keep_their_leading_zero() -> None:
     rows = streets_for(("NT", "DARWIN CITY", "0800"))
     assert rows
     assert all(r.postcode == "0800" for r in rows)
 
 
-@needs_db
+@needs_mirror
 def test_an_unpadded_postcode_is_padded_on_the_way_in() -> None:
     """A caller that went through an int arrives with '800'."""
     assert streets_for(("NT", "DARWIN CITY", "800")) == streets_for(("NT", "DARWIN CITY", "0800"))

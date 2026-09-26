@@ -1,30 +1,19 @@
 """Street matching for a locality hypothesis.
 
-TEMPORARY DEPARTURE FROM CLAUDE.md, approved deliberately.
+Street rows come from the local SQLite mirror, which is what CLAUDE.md:114-117
+calls for: per-worker Python objects are duplicated and refcounting defeats
+copy-on-write, so the 532k-row gazetteer lives in a file the workers share
+through the OS page cache. `locatron.db.local` owns the connection, opened
+read-only once per worker after the fork.
 
-CLAUDE.md:114-117 says the street gazetteer lives in local SQLite, not Python
-memory and not MySQL on the request path, because per-worker Python objects are
-duplicated and refcounting defeats copy-on-write. That is still the target. None
-of it exists yet: there is no `db/local.py`, no streets loader, no
-`locatron.build.refresh` (the module `locatron-build.service` already points at),
-and `config.sqlite_path` is declared and unread.
+`streets_for_many()` is the only place street rows are read, and the matcher goes
+through it so resolving all three locality hypotheses costs one query. The source
+is passed to the matcher as an argument, so tests inject a fixture and run with
+no store at all.
 
-So street rows come from `locatron_street` in MySQL for now, through exactly one
-function. The rules that make that swappable rather than load-bearing:
-
-- `streets_for_many()` is the only place street rows are read. Nothing outside
-  this module queries `locatron_street`.
-- The matcher goes through the batch form, so resolving costs one round trip for
-  all three locality hypotheses rather than three.
-- The service account's existing SELECT grant is enough. No new grants.
-- No in-process cache. The SQLite mirror is the fix; a stopgap cache would
-  become the thing nobody removes.
-- The matcher takes its source as an argument, so tests inject a fixture and run
-  without a database, and the swap to SQLite changes one function.
-
-`address_ref` is never touched here. Fuzzy matching happens against the few
-dozen streets of one locality, never across the 532,182-row table and never
-across the 15.9M address rows.
+`address_ref` is never touched here. Fuzzy matching happens against the few dozen
+streets of one locality, never across the 532,182-row mirror and never across the
+15.9M address rows.
 """
 
 from __future__ import annotations
@@ -33,9 +22,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from rapidfuzz.distance import Levenshtein
-from sqlalchemy import text
 
-from locatron.db import mysql
+from locatron.db import local
 from locatron.parse.locality import Hypothesis as LocalityHypothesis
 from locatron.parse.locality import ngram_spans
 from locatron.parse.scoring import (
@@ -98,49 +86,42 @@ def _normalise_key(key: LocalityKey) -> LocalityKey:
 def streets_for_many(
     keys: Sequence[LocalityKey],
 ) -> Mapping[LocalityKey, tuple[StreetRow, ...]]:
-    """Every street of each locality, in one query.
+    """Every street of each locality, from the local SQLite mirror.
 
     The only place street rows are read. One statement for all the keys, because
-    the matcher runs against the top three locality hypotheses and three round
-    trips on a latency-sensitive path would be three times the cost of one.
+    the matcher runs against the top three locality hypotheses.
 
-    Keys are matched on (state, locality, postcode), which is the leading part
-    of the table's primary key, so each disjunct is index-backed.
+    Keys match on (state, locality, postcode), which is `ix_streets_locality`, so
+    each disjunct is index-backed. The connection belongs to this worker and was
+    opened after the fork; see `locatron.db.local`.
     """
-    # Normalise on the way in, and key the result by the normalised form. The
-    # column is char(4) and NT is 0800-0899, so a caller that went through an int
-    # anywhere arrives with '800'; keying the output by the raw input instead
-    # returned nothing, because the rows come back padded and did not match.
+    # Normalise on the way in, and key the result by the normalised form. NT is
+    # 0800-0899, so a caller that went through an int anywhere arrives with
+    # '800'; keying the output by the raw input returned nothing, because the
+    # rows come back padded and did not match.
     unique = list(dict.fromkeys(_normalise_key(k) for k in keys))
     if not unique:
         return {}
 
-    clauses: list[str] = []
-    params: dict[str, str] = {}
-    for i, (state, locality, postcode) in enumerate(unique):
-        clauses.append(f"(state = :s{i} AND locality = :l{i} AND postcode = :p{i})")
-        params[f"s{i}"] = state
-        params[f"l{i}"] = locality
-        params[f"p{i}"] = postcode
-
-    sql = f"SELECT {_COLUMNS} FROM locatron_street WHERE {' OR '.join(clauses)}"  # noqa: S608
+    clauses = " OR ".join(["(state = ? AND locality = ? AND postcode = ?)"] * len(unique))
+    params: list[str] = [v for key in unique for v in key]
+    sql = f"SELECT {_COLUMNS} FROM streets WHERE {clauses}"  # noqa: S608
 
     out: dict[LocalityKey, list[StreetRow]] = {k: [] for k in unique}
-    with mysql.session_scope() as s:
-        for r in s.execute(text(sql), params).mappings():
-            row = StreetRow(
-                state=r["state"],
-                locality=r["locality"],
-                postcode=str(r["postcode"]).rjust(4, "0"),
-                street_key=r["street_key"],
-                street_name=r["street_name"],
-                street_type=r["street_type"],
-                street_suffix=r["street_suffix"],
-                address_count=int(r["address_count"] or 0),
-                lat=float(r["lat"]) if r["lat"] is not None else None,
-                lng=float(r["lng"]) if r["lng"] is not None else None,
-            )
-            out.setdefault(row.key, []).append(row)
+    for r in local.connect().execute(sql, params):
+        row = StreetRow(
+            state=r[0],
+            locality=r[1],
+            postcode=str(r[2]).rjust(4, "0"),
+            street_key=r[3],
+            street_name=r[4],
+            street_type=r[5],
+            street_suffix=r[6],
+            address_count=int(r[7] or 0),
+            lat=r[8],
+            lng=r[9],
+        )
+        out.setdefault(row.key, []).append(row)
 
     # Biggest first, so a caller taking the head gets the most-addressed street
     # and two runs never disagree.
