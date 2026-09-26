@@ -294,37 +294,16 @@ as_app uv pip install --python "$VENV/bin/python" --quiet -e "$APP_DIR[export]"
 info "done"
 
 # ---------------------------------------------------------------------------
-
-say "Running tests"
-
-if (( SKIP_TESTS )); then
-    info "skipped"
-elif as_app "$VENV/bin/python" -c 'import pytest' 2>/dev/null; then
-    as_app "$VENV/bin/python" -m pytest "$APP_DIR/tests" -q \
-        || die "tests failed (override with --skip-tests)"
-else
-    info "pytest not installed, skipped"
-fi
-
-# ---------------------------------------------------------------------------
-
-say "Checking config and database"
-
-set -a
-# shellcheck disable=SC1090
-. "$ENV_FILE"
-set +a
-
-if [[ -x "$VENV/bin/locatron" ]]; then
-    as_app "$VENV/bin/locatron" check || die "locatron check failed, see above"
-else
-    info "locatron entry point not installed, skipped"
-fi
-
-# ---------------------------------------------------------------------------
 #
-# Before the restart, because a worker refuses to start without a current
-# mirror. Last in the rebuild order, after normalize_pass and dedupe_locality.
+# Before `locatron check` and before the tests, not after either.
+#
+# check reports a missing mirror as a failure, so with the build downstream of it
+# the first deploy on a fresh container could never succeed: check failed, the
+# script exited, and the mirror it was complaining about was never built. The
+# tests want it too -- six store tests skip without one.
+#
+# Still last in the rebuild order relative to the database: street, locality,
+# normalize_pass, dedupe_locality, then this.
 
 say "Building the street mirror"
 
@@ -364,6 +343,34 @@ PYCHECK
     else
         info "current, not rebuilt"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+
+say "Running tests"
+
+if (( SKIP_TESTS )); then
+    info "skipped"
+elif as_app "$VENV/bin/python" -c 'import pytest' 2>/dev/null; then
+    as_app "$VENV/bin/python" -m pytest "$APP_DIR/tests" -q \
+        || die "tests failed (override with --skip-tests)"
+else
+    info "pytest not installed, skipped"
+fi
+
+# ---------------------------------------------------------------------------
+
+say "Checking config and database"
+
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+if [[ -x "$VENV/bin/locatron" ]]; then
+    as_app "$VENV/bin/locatron" check || die "locatron check failed, see above"
+else
+    info "locatron entry point not installed, skipped"
 fi
 
 # ---------------------------------------------------------------------------
