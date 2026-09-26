@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 from locatron.gazetteer.au import AuGazetteer, LocalityRow
 from locatron.normalize import ngrams
+from locatron.parse.components import PostcodeCandidate
 from locatron.parse.scoring import (
     DEFAULT_WEIGHTS,
     Weights,
@@ -333,7 +334,7 @@ def generate_hypotheses(
     au: AuGazetteer,
     *,
     consumed: Sequence[Span] = (),
-    postcodes: Sequence[tuple[str, Span]] = (),
+    postcodes: Sequence[PostcodeCandidate] = (),
     po_box_found: bool = False,
     fuzzy_min: int | None = None,
     weights: Weights = DEFAULT_WEIGHTS,
@@ -342,15 +343,30 @@ def generate_hypotheses(
 
     `consumed` are spans Prompt A's extractors claimed -- street number, unit,
     PO box -- so no locality key is built across them. `postcodes` are the
-    postcode candidates with their spans, which is how a candidate's own
-    postcode gets corroborated.
+    candidates from `find_postcodes`, which is how a candidate's own postcode
+    gets corroborated.
+
+    A four-digit token always takes the postcode role ahead of a padded
+    three-digit one. A padded candidate counts only when a locality agrees with
+    it or when it is the entire input; otherwise it contributes nothing and its
+    token stays free for the street-number role, because '810 Stuart Highway
+    Winnellie' means a house number even though 0810 is a real postcode.
 
     Fuzzy matching is only attempted when nothing matched exactly, and only
     against the gazetteer. Ranked below every exact and alias hit by
     construction, since BASE_FUZZY_MAX sits under BASE_ALIAS.
     """
-    postcode_values = {pc for pc, _ in postcodes}
-    postcode_span_of = {pc: span for pc, span in postcodes}
+    strong_values = {c.postcode for c in postcodes if not c.padded}
+    # A four-digit token wins the role outright, so padded ones are only in play
+    # when there is no four-digit token at all.
+    weak_values = {c.postcode for c in postcodes if c.padded} if not strong_values else set()
+    postcode_span_of = {c.postcode: c.span for c in postcodes}
+
+    # A padded token may seed the postcode path only when it is the whole input:
+    # '800' means Darwin, but the 810 in a street address does not mean
+    # Nightcliff.
+    whole_input = len(postcodes) == 1 and len(ts) == 1
+    path_values = strong_values or (weak_values if whole_input else set())
     states = find_state_tokens(ts, au, consumed)
     stated = next((s for s in states if s.strong), None)
     hinted = next((s for s in states if not s.strong), None)
@@ -377,8 +393,8 @@ def generate_hypotheses(
     # CARRUM DOWNS is reachable only through 3201. Scoring then ranks them:
     # an agreeing postcode outweighs a name whose postcode contradicts it.
     named_postcodes = {c.postcode for c, _ in found}
-    if not (postcode_values & named_postcodes):
-        for pc, _span in postcodes:
+    if not (path_values & named_postcodes):
+        for pc in path_values:
             for cand in candidates_for_postcode(au, pc):
                 found.append((cand, Span(0, 0)))
 
@@ -389,11 +405,12 @@ def generate_hypotheses(
 
     # A postcode token nothing explains lowers confidence in the whole parse.
     explained = {c.postcode for c, _ in found}
-    unexplained = bool(postcode_values) and not (postcode_values & explained)
+    unexplained = bool(strong_values) and not (strong_values & explained)
 
     hyps: list[Hypothesis] = []
     for cand, span in found:
-        agrees = cand.postcode in postcode_values
+        agrees = cand.postcode in strong_values
+        padded_agrees = cand.postcode in weak_values
         sig = score_candidate(
             match=cand.match,
             fuzzy_ratio=cand.fuzzy_ratio,
@@ -402,7 +419,8 @@ def generate_hypotheses(
             is_postal_only=cand.is_postal_only,
             alias_confidence=cand.alias_confidence,
             postcode_agrees=agrees,
-            postcode_token_present=bool(postcode_values),
+            postcode_padded_agrees=padded_agrees,
+            postcode_token_present=bool(strong_values),
             postcode_unexplained=unexplained,
             stated_state=stated.code if stated else None,
             hinted_state=hinted.code if hinted else None,
@@ -418,7 +436,9 @@ def generate_hypotheses(
                 signals=sig.parts,
                 confidence=0.0,
                 state_span=stated.span if stated and stated.code == cand.state else None,
-                postcode_span=postcode_span_of.get(cand.postcode) if agrees else None,
+                postcode_span=(
+                    postcode_span_of.get(cand.postcode) if agrees or padded_agrees else None
+                ),
             )
         )
 

@@ -56,6 +56,19 @@ POSTCODE_DISAGREE = -0.25
 #: hypothesis, so it lowers confidence in the parse without reordering it.
 POSTCODE_UNEXPLAINED = -0.10
 
+#: Agreement with a postcode recovered from a three-digit token by padding.
+#:
+#: Well below POSTCODE_AGREE because the token is ambiguous by construction: the
+#: 810 in '810 Stuart Highway Winnellie' pads to 0810, a real Nightcliff
+#: postcode, while plainly being a street number. It earns this only when a
+#: locality candidate actually agrees with the padded value, or when the token is
+#: the entire input. Otherwise it contributes nothing at all -- not even a
+#: disagreement -- and the token stays available for the street-number role.
+#:
+#: Still large enough to settle 'Darwin NT 800', where DARWIN CITY agrees on 0800
+#: and nothing else does.
+POSTCODE_PADDED_AGREE = 0.40
+
 # --- state ------------------------------------------------------------------
 
 #: A state the input actually stated, agreeing with the candidate.
@@ -125,6 +138,7 @@ class Weights:
     base_alias: float = BASE_ALIAS
     base_fuzzy_max: float = BASE_FUZZY_MAX
     postcode_agree: float = POSTCODE_AGREE
+    postcode_padded_agree: float = POSTCODE_PADDED_AGREE
     postcode_disagree: float = POSTCODE_DISAGREE
     postcode_unexplained: float = POSTCODE_UNEXPLAINED
     state_agree: float = STATE_AGREE
@@ -182,7 +196,8 @@ def score_candidate(
     is_postal_only: bool,
     alias_confidence: float,
     postcode_agrees: bool,
-    postcode_token_present: bool,
+    postcode_padded_agrees: bool = False,
+    postcode_token_present: bool = False,
     postcode_unexplained: bool,
     stated_state: str | None,
     hinted_state: str | None,
@@ -202,7 +217,12 @@ def score_candidate(
 
     if postcode_agrees:
         parts["postcode_agree"] = w.postcode_agree
+    elif postcode_padded_agrees:
+        parts["postcode_padded_agree"] = w.postcode_padded_agree
     elif postcode_token_present:
+        # Only a four-digit token creates a disagreement. A padded one that
+        # nothing agrees with contributes nothing, so it cannot push a correct
+        # locality down for failing to match a stripped house number.
         parts["postcode_disagree"] = w.postcode_disagree
     if postcode_unexplained:
         parts["postcode_unexplained"] = w.postcode_unexplained

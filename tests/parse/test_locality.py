@@ -227,21 +227,25 @@ def test_confidence_falls_as_the_runner_up_closes() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _prompt_a(ts: object) -> tuple[list[Span], bool, list[tuple[str, Span]]]:
+def _prompt_a(ts: object) -> tuple[list[Span], bool, object]:
     """Run Prompt A's extractors, as the pipeline will in a later prompt.
 
     A four-digit token is read as a postcode rather than a street number when
     both extractors propose it, which is the one arbitration this glue makes.
     """
+    from locatron.gazetteer.au import load_au
+
     boxes = find_po_boxes(ts)  # type: ignore[arg-type]
     spans: list[Span] = [b.span for b in boxes]
     spans += [u.span for u in find_units_and_levels(ts)]  # type: ignore[arg-type]
-    postcodes = [(p.postcode, p.span) for p in find_postcodes(ts) if not p.padded]  # type: ignore[arg-type]
-    pc_starts = {s.start for _, s in postcodes}
+    postcodes = find_postcodes(ts, frozenset(load_au().by_postcode))  # type: ignore[arg-type]
+    # Only a four-digit token is taken out of the street-number role. A padded
+    # three-digit one stays available for it, which is the whole point.
+    four_starts = {c.span.start for c in postcodes if not c.padded}
     spans += [
         n.span
         for n in find_street_numbers(ts)  # type: ignore[arg-type]
-        if n.span.start not in pc_starts and not any(n.span.overlaps(s) for s in spans)
+        if n.span.start not in four_starts and not any(n.span.overlaps(s) for s in spans)
     ]
     return spans, bool(boxes), postcodes
 
@@ -411,7 +415,9 @@ def test_nt_postcodes_keep_their_leading_zero(raw: str) -> None:
     assert len(top.candidate.postcode) == 4
     assert isinstance(top.candidate.postcode, str)
     # Every postcode token reaching the model is a padded four-character string.
-    assert all(len(pc) == 4 and pc.startswith("0") for pc, _ in _prompt_a(tokenize(raw))[2])
+    assert all(
+        len(c.postcode) == 4 and c.postcode.startswith("0") for c in _prompt_a(tokenize(raw))[2]
+    )
 
 
 @needs_db
@@ -585,3 +591,104 @@ def test_street_tokens_survive_a_postcode_path_win() -> None:
         ("14-40 Wills Street 3000", ["WILLS STREET"]),
     ]:
         assert _street_text(raw) == expected, raw
+
+
+# ---------------------------------------------------------------------------
+# three-digit postcodes with the leading zero stripped upstream
+# ---------------------------------------------------------------------------
+
+
+@needs_db
+@pytest.mark.parametrize(
+    ("raw", "locality", "postcode"),
+    [
+        ("800", "DARWIN CITY", "0800"),
+        ("200", "ANU", "0200"),
+    ],
+)
+def test_a_bare_three_digit_postcode_resolves(raw: str, locality: str, postcode: str) -> None:
+    """'800' is Darwin and '200' the ANU, with the leading zero stripped
+    upstream. Being the entire input is what makes the padded token count."""
+    _ts, _consumed, hyps = _hyps(raw)
+    assert hyps, raw
+    top = hyps[0]
+    assert top.candidate.locality == locality
+    assert top.candidate.postcode == postcode
+    assert "postcode_padded_agree" in top.signals
+
+
+@needs_db
+def test_a_padded_postcode_agreeing_with_a_named_locality_counts() -> None:
+    """'Darwin NT 800': DARWIN agrees on 0800 and nothing else does."""
+    _ts, _consumed, hyps = _hyps("Darwin NT 800")
+    top = hyps[0]
+    assert top.candidate.postcode == "0800"
+    assert top.signals["postcode_padded_agree"] == scoring.POSTCODE_PADDED_AGREE
+    assert "postcode_agree" not in top.signals
+
+
+@needs_db
+def test_a_padded_postcode_that_nothing_agrees_with_contributes_nothing() -> None:
+    """'810 Stuart Highway Winnellie': 0810 is a real Nightcliff postcode, but
+    Winnellie is 0820, so the token must earn nothing rather than argue against
+    the locality the input actually named."""
+    _ts, _consumed, hyps = _hyps("810 Stuart Highway Winnellie")
+    top = hyps[0]
+    assert top.candidate.locality == "WINNELLIE"
+    assert top.candidate.postcode == "0820"
+    assert "postcode_padded_agree" not in top.signals
+    assert "postcode_agree" not in top.signals
+    assert "postcode_disagree" not in top.signals, "a padded token must not argue"
+    assert top.postcode_span is None, "so the token stays free for the number role"
+
+
+@needs_db
+def test_a_four_digit_token_takes_the_role_ahead_of_a_padded_one() -> None:
+    """'810 Stuart Highway Winnellie NT 0820': both 810 and 0820 are postcode
+    shaped, and the four-digit one wins outright."""
+    _ts, _consumed, hyps = _hyps("810 Stuart Highway Winnellie NT 0820")
+    top = hyps[0]
+    assert top.candidate.postcode == "0820"
+    assert top.signals["postcode_agree"] == scoring.POSTCODE_AGREE
+    assert "postcode_padded_agree" not in top.signals
+    # No Nightcliff: the padded value never seeded the postcode path.
+    assert "NIGHTCLIFF" not in {h.candidate.locality for h in hyps}
+
+
+@needs_db
+def test_the_stripped_number_stays_available_as_a_street_number() -> None:
+    """The 810 must reach the street-number extractor in both orderings."""
+    for raw in ["810 Stuart Highway Winnellie", "810 Stuart Highway Winnellie NT 0820"]:
+        ts = tokenize(raw)
+        numbers = [n.number_first for n in find_street_numbers(ts)]
+        assert "810" in numbers, raw
+        consumed, _po, _pcs = _prompt_a(ts)
+        assert Span(0, 1) in consumed, f"{raw}: 810 was not claimed as the number"
+
+
+@needs_db
+def test_an_unknown_three_digit_token_is_not_a_postcode_at_all() -> None:
+    """0123 is not a real postcode, so '123' proposes nothing."""
+    ts = tokenize("123")
+    assert _prompt_a(ts)[2] == ()
+    assert _hyps("123")[2] == ()
+
+
+@needs_db
+def test_padded_agreement_scores_below_a_four_digit_one() -> None:
+    padded = _hyps("Darwin NT 800")[2][0]
+    exact = _hyps("Darwin NT 0800")[2][0]
+    assert padded.candidate.locality_id == exact.candidate.locality_id
+    assert padded.score < exact.score
+    assert scoring.POSTCODE_PADDED_AGREE < scoring.POSTCODE_AGREE
+
+
+@needs_db
+def test_every_postcode_leaving_the_parser_is_four_digits() -> None:
+    """Canonical form is four-digit zero-padded everywhere inside Locatron."""
+    for raw in ["800", "200", "Darwin NT 800", "810 Stuart Highway Winnellie NT 0820", "3201"]:
+        ts = tokenize(raw)
+        for c in _prompt_a(ts)[2]:
+            assert len(c.postcode) == 4, (raw, c)
+        for h in _hyps(raw)[2]:
+            assert len(h.candidate.postcode) == 4, (raw, h)

@@ -21,6 +21,7 @@ candidate whether or not 9999 is a real postcode, because the check against
 from __future__ import annotations
 
 import re
+from collections.abc import Container
 from dataclasses import dataclass
 
 from locatron.parse.tokens import Span, TokenStream
@@ -31,9 +32,9 @@ from locatron.parse.tokens import Span, TokenStream
 _NUMBER = r"[0-9]{1,6}[A-Z]?"
 
 _POSTCODE_RE = re.compile(r"^[0-9]{4}$")
-#: Three digits, which is what a postcode looks like after a careless load has
-#: dropped its leading zero. NT is 0800-0899, so the whole territory is exposed
-#: to it. See `PostcodeCandidate.padded`.
+#: Three digits, which is what a postcode looks like once something upstream has
+#: dropped its leading zero -- 800 for Darwin, 200 for the ANU. Only a candidate
+#: when the padded form is a real postcode; see `find_postcodes`.
 _SHORT_POSTCODE_RE = re.compile(r"^[0-9]{3}$")
 _BOX_NUMBER_RE = re.compile(rf"^{_NUMBER}$")
 
@@ -48,10 +49,12 @@ class PostcodeCandidate:
     padded: bool = False
     """True when recovered from a three-digit token by left-padding a zero.
 
-    Separate from the rest so a caller can ignore these entirely. They are
-    genuinely ambiguous -- the 800 in 'Level 3 800 Bourke St' pads to 0800,
-    which is a real Darwin postcode -- so a scorer should weight them well below
-    a four-digit hit rather than treat them alike.
+    The value is already padded either way; this says how it was arrived at.
+    Kept separate because these are genuinely ambiguous: the 810 in
+    '810 Stuart Highway Winnellie' pads to 0810, a real Nightcliff postcode, but
+    the input plainly means a street number. So a padded candidate earns nothing
+    unless a locality agrees with it or it is the whole input, and a four-digit
+    token always takes the postcode role ahead of it.
     """
 
 
@@ -65,25 +68,45 @@ class PoBox:
     span: Span
 
 
-def find_postcodes(ts: TokenStream) -> tuple[PostcodeCandidate, ...]:
-    """Every token that could be a postcode, in token order.
+def find_postcodes(
+    ts: TokenStream, known: Container[str] | None = None
+) -> tuple[PostcodeCandidate, ...]:
+    """Every token that could be a postcode, in token order, always four digits.
 
     Returns all of them. '65 CLIFTON PARK DRIVE 3201 CARRUM DOWNS' and
     '65 CLIFTON PARK DR CARRUM DOWNS VIC 3201' both yield 3201 from different
     positions, which is the point: the parser is not positional.
 
+    `known` is the set of real four-digit postcodes, supplied by the caller so
+    this module stays free of the gazetteer. It gates three-digit tokens only:
+    one becomes a candidate just when its zero-padded form is a postcode that
+    actually exists. Without it, three-digit tokens are ignored entirely, since
+    the alternative is inventing candidates for every house number under 1000.
+
+    There are no hard-coded ranges. NT being 0800-0899 and ACT 0200 is why the
+    case exists, but which codes are real is the data's business, not this
+    function's.
+
     >>> from locatron.parse.tokens import tokenize
     >>> [c.postcode for c in find_postcodes(tokenize("Darwin NT 0800"))]
     ['0800']
+    >>> [(c.postcode, c.padded)
+    ...  for c in find_postcodes(tokenize("Darwin NT 800"), {"0800"})]
+    [('0800', True)]
+    >>> find_postcodes(tokenize("Darwin NT 800"))
+    ()
     """
     out: list[PostcodeCandidate] = []
     for token in ts:
         if _POSTCODE_RE.match(token.text):
             out.append(PostcodeCandidate(postcode=token.text, span=token.span))
-        elif _SHORT_POSTCODE_RE.match(token.text):
-            out.append(
-                PostcodeCandidate(postcode=token.text.rjust(4, "0"), span=token.span, padded=True)
-            )
+        elif known is not None and _SHORT_POSTCODE_RE.match(token.text):
+            # Emitted already padded. Canonical form is four digits everywhere
+            # inside Locatron and in every response, so nothing downstream ever
+            # sees '800' from here.
+            padded = token.text.rjust(4, "0")
+            if padded in known:
+                out.append(PostcodeCandidate(postcode=padded, span=token.span, padded=True))
     return tuple(out)
 
 

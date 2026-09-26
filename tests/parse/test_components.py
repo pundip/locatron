@@ -166,23 +166,41 @@ def test_postcode_position_is_not_assumed() -> None:
     assert after[0].span.start == 7
 
 
+#: Stands in for the gazetteer's postcode set. 0123 is deliberately absent.
+KNOWN_POSTCODES = frozenset({"0800", "0200", "0810", "0820", "3000", "3201"})
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
         ("Darwin NT 800", ["0800"]),
-        ("899", ["0899"]),
-        ("100", ["0100"]),
+        ("200", ["0200"]),
+        ("810", ["0810"]),
     ],
 )
 def test_three_digit_tokens_come_back_padded_and_flagged(raw: str, expected: list[str]) -> None:
-    """Recovered, but marked, so a scorer can weight them down or drop them."""
-    cands = find_postcodes(tokenize(raw))
+    """Already padded on the way out: nothing downstream sees '800'."""
+    cands = find_postcodes(tokenize(raw), KNOWN_POSTCODES)
     assert [c.postcode for c in cands] == expected
     assert all(c.padded for c in cands)
+    assert all(len(c.postcode) == 4 for c in cands)
+
+
+@pytest.mark.parametrize("raw", ["123", "999", "655", "Level 3 123 Bourke St"])
+def test_three_digit_tokens_that_are_not_real_postcodes_are_ignored(raw: str) -> None:
+    """No hard-coded ranges: whether 0123 exists is the data's business."""
+    assert [c for c in find_postcodes(tokenize(raw), KNOWN_POSTCODES) if c.padded] == []
+
+
+def test_three_digit_tokens_need_the_known_set() -> None:
+    """Without it there is no way to tell a postcode from a house number, so
+    none are proposed."""
+    assert find_postcodes(tokenize("Darwin NT 800")) == ()
+    assert find_postcodes(tokenize("800")) == ()
 
 
 def test_padded_candidates_are_separable_from_real_ones() -> None:
-    cands = find_postcodes(tokenize("Level 3 800 Bourke St Melbourne 3000"))
+    cands = find_postcodes(tokenize("Level 3 800 Bourke St Melbourne 3000"), KNOWN_POSTCODES)
     assert [(c.postcode, c.padded) for c in cands] == [("0800", True), ("3000", False)]
 
 
