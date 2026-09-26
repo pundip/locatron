@@ -705,13 +705,13 @@ def resolve_streets(
         parts = dict(h.signals)
         substitution: TypeSubstitution | None = None
         if best is not None:
+            # Weight times score, so a worse street contributes less. It used to
+            # add the penalty's scaled share back so the mismatch could be shown
+            # on its own line, which left street_match at the full weight for a
+            # 0.700 match and made every match over the threshold look alike.
             parts["street_match"] = weights.street_match_weight * best.match_score
             if best.type_mismatch:
-                # Already inside match_score; surfaced so a breakdown shows why.
                 parts["street_type_mismatch"] = weights.type_mismatch_penalty
-                parts["street_match"] -= weights.type_mismatch_penalty * (
-                    weights.street_match_weight
-                )
                 type_word = ts.slice(best.span)[-1].text
                 substitution = TypeSubstitution(
                     written_as=type_word,
