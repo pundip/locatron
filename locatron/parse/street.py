@@ -89,6 +89,12 @@ _COLUMNS = (
 )
 
 
+def _normalise_key(key: LocalityKey) -> LocalityKey:
+    """Pad the postcode so a key built from an int still matches."""
+    state, locality, postcode = key
+    return (state, locality, postcode.rjust(4, "0"))
+
+
 def streets_for_many(
     keys: Sequence[LocalityKey],
 ) -> Mapping[LocalityKey, tuple[StreetRow, ...]]:
@@ -101,7 +107,11 @@ def streets_for_many(
     Keys are matched on (state, locality, postcode), which is the leading part
     of the table's primary key, so each disjunct is index-backed.
     """
-    unique = list(dict.fromkeys(keys))
+    # Normalise on the way in, and key the result by the normalised form. The
+    # column is char(4) and NT is 0800-0899, so a caller that went through an int
+    # anywhere arrives with '800'; keying the output by the raw input instead
+    # returned nothing, because the rows come back padded and did not match.
+    unique = list(dict.fromkeys(_normalise_key(k) for k in keys))
     if not unique:
         return {}
 
@@ -111,9 +121,7 @@ def streets_for_many(
         clauses.append(f"(state = :s{i} AND locality = :l{i} AND postcode = :p{i})")
         params[f"s{i}"] = state
         params[f"l{i}"] = locality
-        # Defensive pad. The column is char(4), but NT is 0800-0899 and a
-        # caller that went through an int anywhere would arrive with '800'.
-        params[f"p{i}"] = postcode.rjust(4, "0")
+        params[f"p{i}"] = postcode
 
     sql = f"SELECT {_COLUMNS} FROM locatron_street WHERE {' OR '.join(clauses)}"  # noqa: S608
 
@@ -144,7 +152,8 @@ def streets_for_many(
 def streets_for(key: LocalityKey) -> tuple[StreetRow, ...]:
     """One locality's streets. A convenience over the batch form, not a second
     query path."""
-    return streets_for_many([key]).get(key, ())
+    normalised = _normalise_key(key)
+    return streets_for_many([normalised]).get(normalised, ())
 
 
 # ---------------------------------------------------------------------------
@@ -417,15 +426,20 @@ def codes_for_token(token: str) -> frozenset[str]:
 def name_similarity(a: str, b: str) -> float:
     """0-100 similarity between two street names.
 
-    Levenshtein, not Jaro-Winkler. Jaro-Winkler weights a shared prefix, which
-    is right for localities and exactly wrong here: it scored
-    'HAMILTON CRESCENT' at 92.94 against HAMILTON CR, HAMILTON CT *and*
-    HAMILTON ST, an identical three-way tie between Crescent, Court and Street.
-    Levenshtein separates them because the differing characters are counted
-    wherever they fall.
+    Levenshtein, not Jaro-Winkler, and applied to the name part only.
 
-    It is only ever applied to the name part, never to name-plus-type, because
-    the type is settled by the table rather than by similarity.
+    To be clear about which problem this solves: it is NOT the CR/CT/ST tie.
+    Neither metric separates those -- 'HAMILTON CRESCENT' scores 92.94 against
+    HAMILTON CR, HAMILTON CT and HAMILTON ST under Jaro-Winkler and 64.71
+    against all three under Levenshtein. The type is settled by TYPE_SPELLINGS,
+    not by similarity, which is the whole reason name and type are scored apart.
+
+    What Levenshtein fixes is the name comparison. Jaro-Winkler weights a shared
+    prefix, so it badly over-scores a name whose tail differs: 'CLIFTON PARK'
+    against 'CLIFTON' is 91.67 under Jaro-Winkler and 58.33 under Levenshtein,
+    and 'SMITH' against 'SMITHFIELD' is 90.00 against 50.00. At any usable
+    threshold the prefix-weighted metric would treat a shorter or longer street
+    name as the same street. Levenshtein counts the difference wherever it falls.
     """
     if not a or not b:
         return 0.0
