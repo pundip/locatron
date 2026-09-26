@@ -1,0 +1,30 @@
+# /etc/sudoers.d/locatron
+#
+# Installed automatically by deploy/install.sh, which validates it with
+# visudo -c first. To install by hand:
+#
+#     visudo -c -f deploy/sudoers.locatron
+#     install -m 0440 deploy/sudoers.locatron /etc/sudoers.d/locatron
+#
+# Lets deploy.sh restart services without a password when run as the locatron
+# user. Not needed if you only ever run deploy.sh as root.
+#
+# Deliberately narrow: specific commands only, no blanket systemctl, no shell.
+
+Cmnd_Alias LOCATRON_SVC = \
+    /usr/bin/systemctl restart locatron-api, \
+    /usr/bin/systemctl restart locatron-bulk, \
+    /usr/bin/systemctl reload-or-restart locatron-api, \
+    /usr/bin/systemctl reload-or-restart locatron-bulk, \
+    /usr/bin/systemctl stop locatron-api, \
+    /usr/bin/systemctl stop locatron-bulk, \
+    /usr/bin/systemctl start locatron-api, \
+    /usr/bin/systemctl start locatron-bulk, \
+    /usr/bin/systemctl status locatron-api, \
+    /usr/bin/systemctl status locatron-bulk, \
+    /usr/bin/systemctl is-active locatron-api, \
+    /usr/bin/systemctl is-active locatron-bulk, \
+    /usr/bin/journalctl -u locatron-api *, \
+    /usr/bin/journalctl -u locatron-bulk *
+
+locatron ALL=(root) NOPASSWD: LOCATRON_SVC
