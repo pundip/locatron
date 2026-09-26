@@ -44,7 +44,10 @@ def loaders(monkeypatch: pytest.MonkeyPatch) -> dict[str, _Loader]:
     monkeypatch.setattr(
         warm_mod,
         "LOADERS",
-        tuple((name, ldr, lambda _g, n=name: len(n)) for name, ldr in made.items()),
+        tuple(
+            (name, ldr, lambda _g, n=name: {"rows": len(n), "keys": 1})
+            for name, ldr in made.items()
+        ),
     )
     return made
 
@@ -97,7 +100,9 @@ def test_each_loader_timed_and_logged_at_info(loaders: dict[str, _Loader]) -> No
     assert [e["gazetteer"] for e in loaded] == ["au", "cities", "countries"]
     assert all(e["log_level"] == "info" for e in loaded)
     assert all(isinstance(e["ms"], float) for e in loaded)
-    assert [e["entries"] for e in loaded] == [2, 6, 9]
+    # Counts are splatted onto the line, not collapsed into one number.
+    assert [e["rows"] for e in loaded] == [2, 6, 9]
+    assert all(e["keys"] == 1 for e in loaded)
 
     total = [e for e in logs if e["event"] == "gazetteers_warm"]
     assert len(total) == 1
@@ -131,3 +136,58 @@ def test_real_loaders_are_registered_in_dependency_order() -> None:
 
     assert [name for name, _, _ in warm_mod.LOADERS] == ["au", "cities", "countries"]
     assert [ldr for _, ldr, _ in warm_mod.LOADERS] == [load_au, load_cities, load_countries]
+
+
+# ---------------------------------------------------------------------------
+# count reporting
+# ---------------------------------------------------------------------------
+
+
+class _FakeAu:
+    """Two locality rows under one key, plus aliases, mirroring the real shape."""
+
+    by_id = {1: object(), 2: object(), 3: object()}
+    by_norm = {"PERTH": (object(), object()), "ARANDA": (object(),)}
+    aliases = {"NT WINNELLIE": (object(), object()), "MT ELIZA": (object(),)}
+
+
+class _FakeCities:
+    by_norm = {"ZURICH": (object(),), "SAO PAULO": (object(), object())}
+
+
+class _FakeCountries:
+    by_alpha3 = {"AUS": object(), "NZL": object()}
+    tokens = {"AUSTRALIA": "AUS"}
+    hints = {"AUSTRALIA": "AUS", "DOWN UNDER": "AUS", "NZ": "NZL"}
+
+
+def test_au_counts_keep_rows_keys_and_aliases_apart() -> None:
+    """The confusion this fixes: 3 rows under 2 keys is not 2 rows."""
+    assert warm_mod._au_counts(_FakeAu()) == {
+        "rows": 3,
+        "keys": 2,
+        "aliases": 3,
+        "alias_keys": 2,
+    }
+
+
+def test_cities_counts_call_it_index_entries_not_rows() -> None:
+    """A city indexed under two spellings is one row but two entries, so the
+    label must not claim to be a row count."""
+    assert warm_mod._cities_counts(_FakeCities()) == {"keys": 2, "index_entries": 3}
+
+
+def test_countries_counts() -> None:
+    assert warm_mod._countries_counts(_FakeCountries()) == {
+        "rows": 2,
+        "tokens": 1,
+        "hints": 3,
+    }
+
+
+def test_every_loader_has_a_counts_callable_returning_a_dict() -> None:
+    fakes = {"au": _FakeAu(), "cities": _FakeCities(), "countries": _FakeCountries()}
+    for name, _, counts in warm_mod.LOADERS:
+        out = counts(fakes[name])
+        assert isinstance(out, dict) and out, name
+        assert all(isinstance(v, int) for v in out.values()), name

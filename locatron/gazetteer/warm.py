@@ -30,11 +30,42 @@ from locatron.gazetteer.countries import load_countries
 
 log = structlog.get_logger("locatron.gazetteer")
 
-#: (name, loader, size-of-result). Dependency order — see the module docstring.
-LOADERS: tuple[tuple[str, Callable[[], Any], Callable[[Any], int]], ...] = (
-    ("au", load_au, lambda g: len(g.by_norm)),
-    ("cities", load_cities, lambda g: len(g.by_norm)),
-    ("countries", load_countries, lambda g: len(g.by_alpha3)),
+def _au_counts(g: Any) -> dict[str, int]:
+    """Rows, keys and aliases, kept apart on purpose.
+
+    A single count invites the wrong question. `by_norm` is keyed by norm_key
+    alone, so 18,567 locality rows sit under 16,228 keys — homonyms like PERTH
+    (WA and TAS) and the 148 postal ranges under SYDNEY share a key by design,
+    and `lookup()` filters by state afterwards. Reporting only the key count
+    reads as though 2,339 rows went missing, and reporting no alias count at
+    all hides 61,155 rows completely.
+    """
+    return {
+        "rows": len(g.by_id),
+        "keys": len(g.by_norm),
+        "aliases": sum(len(v) for v in g.aliases.values()),
+        "alias_keys": len(g.aliases),
+    }
+
+
+def _cities_counts(g: Any) -> dict[str, int]:
+    # index_entries, not rows: a city whose local and ASCII spellings normalise
+    # differently ("Zürich"/"Zurich") is indexed under both.
+    return {
+        "keys": len(g.by_norm),
+        "index_entries": sum(len(v) for v in g.by_norm.values()),
+    }
+
+
+def _countries_counts(g: Any) -> dict[str, int]:
+    return {"rows": len(g.by_alpha3), "tokens": len(g.tokens), "hints": len(g.hints)}
+
+
+#: (name, loader, counts-of-result). Dependency order — see the module docstring.
+LOADERS: tuple[tuple[str, Callable[[], Any], Callable[[Any], dict[str, int]]], ...] = (
+    ("au", load_au, _au_counts),
+    ("cities", load_cities, _cities_counts),
+    ("countries", load_countries, _countries_counts),
 )
 
 
@@ -63,7 +94,7 @@ def warm() -> dict[str, float]:
     timings: dict[str, float] = {}
     started = time.perf_counter()
 
-    for name, loader, size in LOADERS:
+    for name, loader, counts in LOADERS:
         if _is_loaded(loader):
             continue
         at = time.perf_counter()
@@ -79,7 +110,7 @@ def warm() -> dict[str, float]:
             )
             continue
         timings[name] = round((time.perf_counter() - at) * 1000.0, 1)
-        log.info("gazetteer_loaded", gazetteer=name, ms=timings[name], entries=size(loaded))
+        log.info("gazetteer_loaded", gazetteer=name, ms=timings[name], **counts(loaded))
 
     log.info(
         "gazetteers_warm",
