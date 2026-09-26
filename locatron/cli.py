@@ -276,5 +276,53 @@ def golden(
         raise typer.Exit(1)
 
 
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+build_app = typer.Typer(
+    add_completion=False, help="Build the derived stores Locatron owns."
+)
+app.add_typer(build_app, name="build")
+
+
+@build_app.command("streets")
+def build_streets(
+    path: str = typer.Option(None, help="Override the configured sqlite_path."),
+    quiet: bool = typer.Option(False, "--quiet", help="Only print the result."),
+) -> None:
+    """Build the local SQLite street mirror from locatron_street.
+
+    Reads only: the session is set TRANSACTION READ ONLY before any query, so
+    SELECT is the only grant required. Writes into a temporary file beside the
+    target and moves it into place, so a reader never sees a half-built mirror.
+    """
+    from locatron.build import streets as build_streets_mod
+
+    target = path or get_settings().sqlite_path
+    typer.echo(f"Source  locatron_street @ {get_settings().mysql_host}")
+    typer.echo(f"Target  {target}")
+
+    def progress(done: int, total: int) -> None:
+        if not quiet:
+            typer.echo(f"  {done}/{total} rows")
+
+    try:
+        meta, seconds = build_streets_mod.build_with_timing(target, progress=progress)
+    except build_streets_mod.BuildError as exc:
+        typer.secho(f"BUILD REFUSED: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+
+    size_mb = Path(target).stat().st_size / 1e6
+    typer.echo(f"  rows           {meta['row_count']}")
+    typer.echo(f"  norm_version   {meta['norm_version']}")
+    typer.echo(f"  snapshot_id    {meta['snapshot_id']}")
+    typer.echo(f"  source_digest  {meta['source_digest']}")
+    typer.echo(f"  built_at       {meta['built_at']}")
+    typer.echo(f"  file           {size_mb:.1f} MB")
+    typer.secho(f"Built in {seconds:.1f}s", fg=typer.colors.GREEN)
+
+
+
 if __name__ == "__main__":
     sys.exit(app())
