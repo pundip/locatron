@@ -10,6 +10,7 @@ User=locatron
 Group=locatron
 WorkingDirectory=/opt/locatron/app
 EnvironmentFile=/opt/locatron/.env
+Environment=GUNICORN_TMP_DIR=/var/lib/locatron
 ExecStart=/opt/locatron/venv/bin/gunicorn locatron.api.app:app \
     -c /opt/locatron/app/deploy/gunicorn.conf.py \
     --worker-class uvicorn.workers.UvicornWorker \
