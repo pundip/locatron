@@ -108,3 +108,22 @@ def test_parse_loads_the_gazetteer_once_for_many_inputs() -> None:
     assert result.exit_code == 0, result.output
     assert load_au.is_loaded() is True  # type: ignore[attr-defined]
     assert result.output.count("input      ") == 10
+
+
+@needs_stores
+def test_both_unit_forms_report_the_same_unit_and_number() -> None:
+    """'5/12' is one token holding both roles. Without that, the slash form
+    reported no number while the spelled form reported 12."""
+    slash = runner.invoke(app, ["parse", "5/12 Smith Street Fitzroy VIC 3065"])
+    spelled = runner.invoke(app, ["parse", "Unit 5 12 Smith Street Fitzroy 3065"])
+    assert slash.exit_code == 0 and spelled.exit_code == 0
+
+    for out in (slash.output, spelled.output):
+        assert "unit=5" in out
+        # The number line is populated either way.
+        number_line = next(ln for ln in out.splitlines() if ln.startswith("  number"))
+        assert "12" in number_line, number_line
+
+    # The slash form says where its number came from.
+    assert "12 (from /)" in slash.output
+    assert "(from /)" not in spelled.output

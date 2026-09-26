@@ -395,10 +395,21 @@ def _extract_components(ts, known_postcodes):
 
     claimed = [b.span for b in boxes] + [u.span for u in units]
     four_digit_starts = {c.span.start for c in postcodes if not c.padded}
+
+    # '5/12' is one token carrying a unit and a street number at once, which is
+    # the whole point of the form. The unit has already claimed that token, so
+    # without this the slash form reported no number at all while the spelled
+    # form 'UNIT 5 12' reported 12. Both now report unit=5, number=12.
+    slash_spans = {u.span for u in units if u.street_number_hint}
+
     numbers = [
         n
         for n in find_street_numbers(ts)
-        if n.span.start not in four_digit_starts and not any(n.span.overlaps(s) for s in claimed)
+        if n.span.start not in four_digit_starts
+        and (
+            not any(n.span.overlaps(s) for s in claimed)
+            or (n.from_slash and n.span in slash_spans)
+        )
     ]
     claimed += [n.span for n in numbers]
     return boxes, units, postcodes, numbers, claimed
