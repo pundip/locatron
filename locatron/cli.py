@@ -345,6 +345,188 @@ def golden(
 
 
 # ---------------------------------------------------------------------------
+# parse
+# ---------------------------------------------------------------------------
+
+#: Signal order for the breakdown, so two runs never print the same numbers in a
+#: different order. Any signal not listed is appended alphabetically, which keeps
+#: a newly added weight visible instead of silently dropped.
+_SIGNAL_ORDER = (
+    "base",
+    "ngram_length",
+    "postcode_agree",
+    "postcode_padded_agree",
+    "postcode_disagree",
+    "postcode_unexplained",
+    "state_agree",
+    "state_disagree",
+    "state_hint_agree",
+    "ambiguity_prior",
+    "postal_only",
+    "alias_trust",
+    "street_match",
+    "street_type_mismatch",
+    "unexplained_tokens",
+)
+
+
+def _extract_components(ts, known_postcodes):
+    """Run Prompt A's extractors and decide which token plays which role.
+
+    This arbitration is not in the package yet: the pipeline that will own it is
+    a later prompt, and until then it lives here and in the parse tests. Two
+    rules, both load-bearing:
+
+    A four-digit postcode token is not also offered as a street number, because
+    it is a postcode far more often than a house number. A padded three-digit one
+    is left available for both, because '810 Stuart Highway Winnellie' means a
+    house number even though 0810 is a real postcode.
+    """
+    from locatron.parse.components import (
+        find_po_boxes,
+        find_postcodes,
+        find_street_numbers,
+        find_units_and_levels,
+    )
+
+    boxes = find_po_boxes(ts)
+    units = find_units_and_levels(ts)
+    postcodes = find_postcodes(ts, known_postcodes)
+
+    claimed = [b.span for b in boxes] + [u.span for u in units]
+    four_digit_starts = {c.span.start for c in postcodes if not c.padded}
+    numbers = [
+        n
+        for n in find_street_numbers(ts)
+        if n.span.start not in four_digit_starts and not any(n.span.overlaps(s) for s in claimed)
+    ]
+    claimed += [n.span for n in numbers]
+    return boxes, units, postcodes, numbers, claimed
+
+
+def _parse_one(text_in: str, au, known_postcodes) -> list[str]:
+    """One input's report, as lines. Pure formatting over the parser stages."""
+    from locatron.parse.locality import generate_hypotheses
+    from locatron.parse.street import resolve_streets
+    from locatron.parse.tokens import tokenize
+
+    ts = tokenize(text_in)
+    boxes, units, postcodes, numbers, claimed = _extract_components(ts, known_postcodes)
+
+    out = [f"input      {text_in!r}", f"tokens     {list(ts.texts)}"]
+
+    out.append("components")
+    out.append(
+        "  postcodes  "
+        + (
+            ", ".join(
+                f"{c.postcode}{' (padded)' if c.padded else ''}@{c.span.start}" for c in postcodes
+            )
+            or "-"
+        )
+    )
+    out.append(
+        "  unit/level "
+        + (
+            ", ".join(
+                f"{u.kind}={u.value}"
+                + (f" kw={u.keyword}" if u.keyword else "")
+                + (f" street#={u.street_number_hint}" if u.street_number_hint else "")
+                for u in units
+            )
+            or "-"
+        )
+    )
+    out.append(
+        "  number     "
+        + (
+            ", ".join(
+                n.number_first
+                + (f"-{n.number_last}" if n.number_last else "")
+                + (" (from /)" if n.from_slash else "")
+                for n in numbers
+            )
+            or "-"
+        )
+    )
+    out.append("  po box     " + (", ".join(f"{b.kind} BOX {b.number}" for b in boxes) or "-"))
+
+    hyps = generate_hypotheses(
+        ts, au, consumed=claimed, postcodes=postcodes, po_box_found=bool(boxes), fuzzy_min=88
+    )
+    joint = resolve_streets(ts, hyps, consumed=claimed)
+
+    if not joint:
+        out.append("hypotheses none")
+        return out
+
+    out.append("hypotheses (top 3)")
+    for i, h in enumerate(joint[:3], 1):
+        c = h.locality.candidate
+        if h.street is not None:
+            sub = h.street_type_substituted
+            street = (
+                f"{h.street.row.street_name!r} type={h.street.row.street_type or '-'} "
+                f"score={h.street.match_score:.3f}"
+            )
+            if sub is not None:
+                street += f" substituted={sub.written_as}({sub.input_type})->{sub.matched_type}"
+        else:
+            street = "-"
+        left = [ts.text_of(s) for s in h.unexplained]
+        out.append(
+            f"  {i}. {c.state}/{c.locality}/{c.postcode}  joint={h.score:.3f}  "
+            f"granularity={h.granularity}"
+        )
+        out.append(f"       street       {street}")
+        out.append(f"       unexplained  {left or '-'}")
+
+    top = joint[0]
+    out.append("breakdown (top)")
+    listed = [k for k in _SIGNAL_ORDER if k in top.signals]
+    extra = sorted(k for k in top.signals if k not in _SIGNAL_ORDER)
+    for k in listed + extra:
+        out.append(f"  {k:<24}{top.signals[k]:>9.3f}")
+    out.append(f"  {'= joint score':<24}{top.score:>9.3f}")
+    return out
+
+
+@app.command()
+def parse(
+    texts: list[str] = typer.Argument(  # noqa: B008 - typer reads the default
+        ..., help="One or more strings to parse."
+    ),
+) -> None:
+    """Run the phase 2 parser stages on each string, without the pipeline.
+
+    Components, then locality hypotheses, then street matching, printed as one
+    block per input. Read-only throughout: nothing here writes to MySQL, to the
+    SQLite mirror, or to locatron_unresolved.
+
+    The gazetteers and the street mirror are loaded once and shared across every
+    input, so parsing fifty strings costs one warm-up rather than fifty.
+    """
+    from locatron.db import local
+    from locatron.gazetteer.au import load_au
+
+    try:
+        local.check_mirror()
+        local.connect()
+    except local.MirrorError as exc:
+        typer.secho(f"{exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+
+    au = load_au()
+    known_postcodes = frozenset(au.by_postcode)
+
+    for i, text_in in enumerate(texts):
+        if i:
+            typer.echo("")
+        for line in _parse_one(text_in, au, known_postcodes):
+            typer.echo(line)
+
+
+# ---------------------------------------------------------------------------
 # build
 # ---------------------------------------------------------------------------
 
