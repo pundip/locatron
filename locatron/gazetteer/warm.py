@@ -30,6 +30,7 @@ from locatron.gazetteer.countries import load_countries
 
 log = structlog.get_logger("locatron.gazetteer")
 
+
 def _au_counts(g: Any) -> dict[str, int]:
     """Rows, keys and aliases, kept apart on purpose.
 
