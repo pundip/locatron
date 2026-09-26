@@ -24,6 +24,12 @@ from dataclasses import dataclass
 
 from locatron.gazetteer.au import AuGazetteer, LocalityRow
 from locatron.normalize import ngrams
+from locatron.parse.scoring import (
+    DEFAULT_WEIGHTS,
+    Weights,
+    confidence,
+    score_candidate,
+)
 from locatron.parse.tokens import Span, TokenStream
 from locatron.resolve.scoring import MatchKind
 
@@ -286,3 +292,173 @@ def find_state_tokens(
         if hint:
             out.append(StateToken(code=hint, span=gram.span, key=gram.key, strong=False))
     return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# hypotheses
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Hypothesis:
+    """One reading of the input's locality, with everything behind the score."""
+
+    candidate: Candidate
+    locality_span: Span
+    score: float
+    signals: dict[str, float]
+    confidence: float
+    state_span: Span | None = None
+    postcode_span: Span | None = None
+
+    @property
+    def consumed(self) -> tuple[Span, ...]:
+        """Spans this reading accounts for, so the street stage knows what is
+        left. The locality, the state token and the postcode token it agreed
+        with -- never a token some other hypothesis claimed."""
+        spans = [self.locality_span]
+        if self.state_span is not None:
+            spans.append(self.state_span)
+        if self.postcode_span is not None:
+            spans.append(self.postcode_span)
+        return tuple(sorted(spans))
+
+    def remaining(self, ts: TokenStream, also: Sequence[Span] = ()) -> tuple[Span, ...]:
+        """Contiguous runs left for the street stage, given this reading."""
+        return ts.runs([*self.consumed, *also])
+
+
+def generate_hypotheses(
+    ts: TokenStream,
+    au: AuGazetteer,
+    *,
+    consumed: Sequence[Span] = (),
+    postcodes: Sequence[tuple[str, Span]] = (),
+    po_box_found: bool = False,
+    fuzzy_min: int | None = None,
+    weights: Weights = DEFAULT_WEIGHTS,
+) -> tuple[Hypothesis, ...]:
+    """Every locality reading of `ts`, ranked best first.
+
+    `consumed` are spans Prompt A's extractors claimed -- street number, unit,
+    PO box -- so no locality key is built across them. `postcodes` are the
+    postcode candidates with their spans, which is how a candidate's own
+    postcode gets corroborated.
+
+    Fuzzy matching is only attempted when nothing matched exactly, and only
+    against the gazetteer. Ranked below every exact and alias hit by
+    construction, since BASE_FUZZY_MAX sits under BASE_ALIAS.
+    """
+    postcode_values = {pc for pc, _ in postcodes}
+    postcode_span_of = {pc: span for pc, span in postcodes}
+    states = find_state_tokens(ts, au, consumed)
+    stated = next((s for s in states if s.strong), None)
+    hinted = next((s for s in states if not s.strong), None)
+
+    grams = ngram_spans(ts, consumed)
+    found: list[tuple[Candidate, Span]] = []
+    for gram in grams:
+        for cand in candidates_for_key(au, gram.key):
+            found.append((cand, gram.span))
+
+    # A *bare* postcode, with no locality named anywhere: '3201' is a golden
+    # row. Gated on nothing having been named, because a postcode-only
+    # hypothesis consumes no name token and so competes unfairly with a real
+    # one: on 'Hamilton Crescent Ryde NSW 2112' it offered PUTNEY and
+    # DENISTONE EAST, which also sit in 2112, as near-ties for RYDE and left
+    # RYDE's own token unconsumed. Corroborating a named locality is what
+    # POSTCODE_AGREE is for; this path is only for when there is no name.
+    if not found:
+        for pc, _span in postcodes:
+            for cand in candidates_for_postcode(au, pc):
+                found.append((cand, Span(0, 0)))
+
+    if not found and fuzzy_min is not None:
+        for gram in grams:
+            for cand in fuzzy_candidates_for_key(au, gram.key, min_score=fuzzy_min):
+                found.append((cand, gram.span))
+
+    # A postcode token nothing explains lowers confidence in the whole parse.
+    explained = {c.postcode for c, _ in found}
+    unexplained = bool(postcode_values) and not (postcode_values & explained)
+
+    hyps: list[Hypothesis] = []
+    for cand, span in found:
+        agrees = cand.postcode in postcode_values
+        sig = score_candidate(
+            match=cand.match,
+            fuzzy_ratio=cand.fuzzy_ratio,
+            ngram_tokens=len(span),
+            address_count=cand.address_count,
+            is_postal_only=cand.is_postal_only,
+            alias_confidence=cand.alias_confidence,
+            postcode_agrees=agrees,
+            postcode_token_present=bool(postcode_values),
+            postcode_unexplained=unexplained,
+            stated_state=stated.code if stated else None,
+            hinted_state=hinted.code if hinted else None,
+            candidate_state=cand.state,
+            po_box_found=po_box_found,
+            w=weights,
+        )
+        hyps.append(
+            Hypothesis(
+                candidate=cand,
+                locality_span=span,
+                score=sig.score,
+                signals=sig.parts,
+                confidence=0.0,
+                state_span=stated.span if stated and stated.code == cand.state else None,
+                postcode_span=postcode_span_of.get(cand.postcode) if agrees else None,
+            )
+        )
+
+    return _rank_hypotheses(hyps, weights)
+
+
+def _rank_hypotheses(hyps: list[Hypothesis], w: Weights) -> tuple[Hypothesis, ...]:
+    """Sort best first and fill in confidence from the margin to the runner-up.
+
+    The tiebreaks after score exist so two runs never disagree: a bigger
+    locality, then a longer matched name, then state and postcode.
+    """
+    if not hyps:
+        return ()
+
+    ordered = sorted(
+        hyps,
+        key=lambda h: (
+            -h.score,
+            -h.candidate.address_count,
+            -len(h.locality_span),
+            h.candidate.state,
+            h.candidate.postcode,
+        ),
+    )
+
+    # One hypothesis per locality, keeping the best-supported reading. A place
+    # is routinely reached twice -- named by an n-gram and again through its
+    # postcode -- and leaving both in makes a locality its own runner-up, which
+    # reads as a near-tie and quietly halves the confidence.
+    seen: set[int] = set()
+    unique: list[Hypothesis] = []
+    for h in ordered:
+        if h.candidate.locality_id in seen:
+            continue
+        seen.add(h.candidate.locality_id)
+        unique.append(h)
+    ordered = unique
+
+    runner_up = ordered[1].score if len(ordered) > 1 else None
+    return tuple(
+        Hypothesis(
+            candidate=h.candidate,
+            locality_span=h.locality_span,
+            score=h.score,
+            signals=h.signals,
+            confidence=confidence(h.score, runner_up if i == 0 else None, w),
+            state_span=h.state_span,
+            postcode_span=h.postcode_span,
+        )
+        for i, h in enumerate(ordered)
+    )
