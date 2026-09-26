@@ -6,6 +6,7 @@
 #   /opt/locatron/app/deploy/deploy.sh --branch dev
 #   /opt/locatron/app/deploy/deploy.sh --skip-tests
 #   /opt/locatron/app/deploy/deploy.sh --no-config
+#   /opt/locatron/app/deploy/deploy.sh --no-mirror
 #   /opt/locatron/app/deploy/deploy.sh --config-only
 #
 # Assumes deploy/install.sh has already run. If the checkout or venv does not
@@ -20,6 +21,9 @@
 # Installs deploy/systemd/locatron-*.service and deploy/nginx.conf whenever they
 # differ from what is live, before anything is restarted. --no-config skips that
 # step; --config-only runs only that step and touches no code.
+#
+# Rebuilds the SQLite street mirror when it is missing, stale or out of step
+# with locatron_street, before services restart. --no-mirror skips it.
 #
 # Roll back: the previous commit is printed at the end.
 #     git -C /opt/locatron/app reset --hard <sha>
@@ -42,6 +46,7 @@ SKIP_TESTS=0
 FORCE=0
 NO_CONFIG=0
 CONFIG_ONLY=0
+NO_MIRROR=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,8 +54,9 @@ while [[ $# -gt 0 ]]; do
         --skip-tests)  SKIP_TESTS=1; shift ;;
         --force)       FORCE=1; shift ;;
         --no-config)   NO_CONFIG=1; shift ;;
+        --no-mirror)   NO_MIRROR=1; shift ;;
         --config-only) CONFIG_ONLY=1; shift ;;
-        -h|--help)     sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)     sed -n '3,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)             echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -313,6 +319,51 @@ if [[ -x "$VENV/bin/locatron" ]]; then
     as_app "$VENV/bin/locatron" check || die "locatron check failed, see above"
 else
     info "locatron entry point not installed, skipped"
+fi
+
+# ---------------------------------------------------------------------------
+#
+# Before the restart, because a worker refuses to start without a current
+# mirror. Last in the rebuild order, after normalize_pass and dedupe_locality.
+
+say "Building the street mirror"
+
+if (( NO_MIRROR )); then
+    info "skipped (--no-mirror)"
+elif [[ ! -x "$VENV/bin/locatron" ]]; then
+    info "locatron entry point not installed, skipped"
+else
+    MIRROR=$(as_app "$VENV/bin/python" -c 'from locatron.config import get_settings; print(get_settings().sqlite_path)')
+    info "mirror  $MIRROR"
+
+    # Cheap checks first: the digest is a full scan of 532k rows and costs about
+    # 1.4s, so it only runs once the mirror exists and matches on version.
+    NEED_BUILD=0
+    REASON=""
+    if [[ ! -f "$MIRROR" ]]; then
+        NEED_BUILD=1; REASON="missing"
+    elif ! as_app "$VENV/bin/python" -c 'from locatron.db import local; local.check_mirror()' 2>/dev/null; then
+        NEED_BUILD=1; REASON="stale or unreadable"
+    elif ! as_app "$VENV/bin/python" - <<'PYCHECK' 2>/dev/null
+import sys
+from locatron.build import streets
+from locatron.db import local, mysql
+meta = local.read_meta()
+with mysql.session_scope() as s:
+    s.execute(__import__("sqlalchemy").text("SET SESSION TRANSACTION READ ONLY"))
+    digest = streets.source_digest(s)
+sys.exit(0 if digest.digest == meta.source_digest else 1)
+PYCHECK
+    then
+        NEED_BUILD=1; REASON="source digest changed"
+    fi
+
+    if (( NEED_BUILD )); then
+        info "rebuilding: $REASON"
+        as_app "$VENV/bin/locatron" build streets --quiet             || die "street mirror build failed"
+    else
+        info "current, not rebuilt"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

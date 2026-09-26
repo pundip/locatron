@@ -29,3 +29,11 @@ htmlcov/
 # Editors
 .idea/
 .vscode/
+
+# The SQLite street mirror. Built from locatron_street by
+# `locatron build streets`, 54.6 MB, and reproducible from the database.
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+data/

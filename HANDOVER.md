@@ -203,11 +203,6 @@ aliases.
 ---
 Outstanding
 Not blocking phase 2.
-Street retrieval uses MySQL via `streets_for()`. The SQLite mirror described in
-CLAUDE.md must land before the pipeline is deployed: there is no `db/local.py`,
-no streets loader and no `locatron.build.refresh`, so `config.sqlite_path` is
-still unused. `locatron/parse/street.py` reads `locatron_street` through one
-batched function so the swap changes that function and nothing else.
 Shared secret not rotated. The `X-Locatron-Edge` value was pasted into a
 chat. Deliberately deferred until the build settles. Rotate on the container
 in `/etc/nginx/sites-available/locatron` and in both edge nginx blocks.

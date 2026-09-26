@@ -109,12 +109,21 @@ Databricks jobs handle a column far more gracefully than an exception.
 | `locatron_locality_alias` | alias_display, locality_id | same |
 
 Rebuild order: street, then locality (locality reads street counts), then
-`scripts/normalize_pass.py`, then `scripts/dedupe_locality.py`.
+`scripts/normalize_pass.py`, then `scripts/dedupe_locality.py`, then
+`locatron build streets`.
 
-`dedupe_locality.py` must run last, and after the normalize pass rather than
-before it: it groups on `norm_key`, which does not exist until that pass fills
-it in. That ordering is what lets it collapse punctuation variants without
-folding punctuation in SQL.
+`dedupe_locality.py` must run after the normalize pass rather than before it: it
+groups on `norm_key`, which does not exist until that pass fills it in. That
+ordering is what lets it collapse punctuation variants without folding
+punctuation in SQL.
+
+`locatron build streets` is genuinely last. It mirrors `locatron_street` into the
+local SQLite file and refuses to run if any `norm_key` is still NULL, which is how
+it proves the normalize pass happened — `locatron_street` has no `norm_key` of its
+own, so the evidence lives in `locatron_locality` and `locatron_locality_alias`.
+The build reads only: it issues `SET SESSION TRANSACTION READ ONLY` before any
+query, so it cannot write even when run as the service account, and it needs no
+grant beyond `SELECT`.
 
 ## Architecture
 
@@ -127,8 +136,13 @@ Single Proxmox LXC. Low container count is a deliberate constraint.
   export cannot starve interactive traffic.
 - `redis` on localhost — result cache only. Losing it must cost latency, never
   correctness.
-- Local SQLite — street gazetteer mirror, shared across workers via the OS page
-  cache.
+- Local SQLite at `config.sqlite_path` — the street gazetteer mirror, 532k rows
+  and about 55 MB, shared across workers via the OS page cache. Built by
+  `locatron build streets`; opened read-only, once per worker, in
+  `post_worker_init` and never before the fork. A missing file or a
+  `norm_version` that disagrees with the code fails worker startup loudly: there
+  is no fallback to MySQL, because that is the silent-miss failure the mirror
+  exists to prevent.
 
 MySQL is external at `pundip.com:3335`, database `ReferenceDB`.
 
@@ -195,6 +209,7 @@ locatron/
 │   ├── cli.py                # resolve from the terminal, no HTTP needed
 │   ├── api/app.py            # :8080
 │   └── bulk/app.py           # :8081
+│   └── build/                # streets.py, the SQLite mirror build
 ├── scripts/
 │   ├── normalize_pass.py
 │   └── dedupe_locality.py    # collapses punctuation-variant localities
