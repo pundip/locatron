@@ -90,6 +90,18 @@ def _alias(au: AuGazetteer, key: str, state: str | None) -> list[Candidate]:
     ]
 
 
+#: How strongly each path counts as evidence. Exact beats alias beats fuzzy.
+_MATCH_ORDER = {MatchKind.EXACT: 0, MatchKind.ALIAS: 1, MatchKind.FUZZY: 2}
+
+
+def _strength(c: Candidate) -> tuple[int, float]:
+    """Sort key for "reached the better way". Lower wins.
+
+    Negated fuzzy_ratio so that within one path the closer match sorts first.
+    """
+    return (_MATCH_ORDER[c.match], -c.fuzzy_ratio)
+
+
 def _dedupe(cands: list[Candidate]) -> tuple[Candidate, ...]:
     """One candidate per locality, keeping the strongest way it was reached.
 
@@ -97,13 +109,10 @@ def _dedupe(cands: list[Candidate]) -> tuple[Candidate, ...]:
     alias keys are also locality keys -- and counting it twice would make it
     look like two pieces of evidence for the same place.
     """
-    order = {MatchKind.EXACT: 0, MatchKind.ALIAS: 1, MatchKind.FUZZY: 2}
     best: dict[int, Candidate] = {}
     for c in cands:
         prev = best.get(c.locality_id)
-        if prev is None or order[c.match] < order[prev.match]:
-            best[c.locality_id] = c
-        elif order[c.match] == order[prev.match] and c.fuzzy_ratio > prev.fuzzy_ratio:
+        if prev is None or _strength(c) < _strength(prev):
             best[c.locality_id] = c
     return tuple(best.values())
 
