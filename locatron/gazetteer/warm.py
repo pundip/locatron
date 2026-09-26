@@ -12,8 +12,10 @@ itself to build its sub-national exclusion set, so warming those two first is
 what keeps each reported timing attributable to one loader instead of charging
 their cost to whichever ran first.
 
-The street gazetteer is not here. It belongs in SQLite, where workers share OS
-page cache rather than each holding a copy. See CLAUDE.md.
+The street gazetteer is not loaded into memory here -- it belongs in SQLite,
+where workers share OS page cache rather than each holding a copy. What `warm()`
+does for it is open this worker's read-only connection, which must happen after
+the fork. See CLAUDE.md.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from typing import Any
 
 import structlog
 
+from locatron.db import local
 from locatron.gazetteer.au import load_au
 from locatron.gazetteer.cities import load_cities
 from locatron.gazetteer.countries import load_countries
@@ -77,11 +80,12 @@ def _is_loaded(loader: Callable[[], Any]) -> bool:
 
 
 def is_warm() -> bool:
-    """Whether every gazetteer in this process is loaded.
+    """Whether this process is ready: every gazetteer loaded and the street
+    mirror open.
 
     Surfaced on /healthz so a cold worker is visible rather than silent.
     """
-    return all(_is_loaded(loader) for _, loader, _ in LOADERS)
+    return local.is_open() and all(_is_loaded(loader) for _, loader, _ in LOADERS)
 
 
 def warm() -> dict[str, float]:
@@ -94,6 +98,24 @@ def warm() -> dict[str, float]:
     """
     timings: dict[str, float] = {}
     started = time.perf_counter()
+
+    # The street mirror, opened here and nowhere earlier: a sqlite3 connection
+    # must be created after the fork, or several workers share one cursor and one
+    # lock. Unlike a gazetteer load this is allowed to fail the worker -- a
+    # missing or stale mirror has no safe fallback, and serving from MySQL
+    # instead is the silent-miss failure the mirror exists to prevent.
+    at = time.perf_counter()
+    meta = local.check_mirror()
+    local.connect()
+    timings["streets"] = round((time.perf_counter() - at) * 1000.0, 1)
+    log.info(
+        "street_mirror_open",
+        ms=timings["streets"],
+        rows=meta.row_count,
+        norm_version=meta.norm_version,
+        snapshot_id=meta.snapshot_id,
+        built_at=meta.built_at,
+    )
 
     for name, loader, counts in LOADERS:
         if _is_loaded(loader):

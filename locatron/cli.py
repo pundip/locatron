@@ -50,9 +50,73 @@ def _validate_table(name: str) -> str:
     return resolved
 
 
+def _check_street_mirror(*, deep: bool) -> list[str]:
+    """Report on the SQLite street mirror. Returns problems, if any."""
+    from locatron.db import local
+
+    try:
+        meta = local.read_meta()
+    except local.MirrorError as exc:
+        typer.echo(f"  {'street mirror':<32} MISSING")
+        return [str(exc)]
+
+    typer.echo(f"  {'street mirror':<32} {meta.path}")
+    typer.echo(f"  {'  rows':<32} {meta.row_count}")
+    typer.echo(f"  {'  norm_version':<32} {meta.norm_version}")
+    typer.echo(f"  {'  snapshot_id':<32} {meta.snapshot_id}")
+    typer.echo(f"  {'  built_at':<32} {meta.built_at}")
+
+    problems: list[str] = []
+    if not meta.is_current:
+        problems.append(
+            f"street mirror built with NORM_VERSION {meta.norm_version!r}, "
+            f"code is {NORM_VERSION!r} - run `locatron build streets`"
+        )
+
+    # Row count is cheap and catches a truncated source without a full scan.
+    try:
+        with mysql.session_scope() as sess:
+            source_rows = sess.execute(text("SELECT COUNT(*) FROM locatron_street")).scalar()
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        typer.echo(f"  {'  source rows':<32} unavailable ({type(exc).__name__})")
+        return problems
+
+    typer.echo(f"  {'  source rows':<32} {source_rows}")
+    if source_rows != meta.row_count:
+        problems.append(
+            f"street mirror has {meta.row_count} rows, locatron_street has "
+            f"{source_rows} - run `locatron build streets`"
+        )
+
+    if deep:
+        from locatron.build import streets as build_streets_mod
+
+        with mysql.session_scope() as sess:
+            digest = build_streets_mod.source_digest(sess)
+        typer.echo(f"  {'  mirror digest':<32} {meta.source_digest}")
+        typer.echo(f"  {'  source digest':<32} {digest.digest}")
+        if digest.digest != meta.source_digest:
+            problems.append(
+                "street mirror digest does not match locatron_street - "
+                "the source changed, run `locatron build streets`"
+            )
+
+    return problems
+
+
 @app.command()
-def check() -> None:
-    """Verify config and database connectivity."""
+def check(
+    deep: bool = typer.Option(
+        False, "--deep", help="Also digest locatron_street to detect source drift (~1.4s)."
+    ),
+) -> None:
+    """Verify config, database connectivity and the street mirror.
+
+    The mirror check defaults to norm_version and row count, which are local and
+    instant. --deep adds the full content digest, a scan of all 532k rows, which
+    is the only thing that detects locatron_street changing underneath a mirror
+    whose NORM_VERSION still matches.
+    """
     s = get_settings()
     typer.echo(f"MySQL   {s.mysql_user}@{s.mysql_host}:{s.mysql_port}/{s.mysql_database}")
     files = env_files()
@@ -76,6 +140,10 @@ def check() -> None:
     problems = []
     if not h.get("connected"):
         problems.append("cannot reach MySQL")
+
+    typer.echo("")
+    problems += _check_street_mirror(deep=deep)
+
     if h.get("locality_norm_key_missing"):
         problems.append("locatron_locality has unpopulated norm_key, run normalize_pass.py")
     if h.get("alias_norm_key_missing"):
@@ -280,9 +348,7 @@ def golden(
 # build
 # ---------------------------------------------------------------------------
 
-build_app = typer.Typer(
-    add_completion=False, help="Build the derived stores Locatron owns."
-)
+build_app = typer.Typer(add_completion=False, help="Build the derived stores Locatron owns.")
 app.add_typer(build_app, name="build")
 
 
@@ -321,7 +387,6 @@ def build_streets(
     typer.echo(f"  built_at       {meta['built_at']}")
     typer.echo(f"  file           {size_mb:.1f} MB")
     typer.secho(f"Built in {seconds:.1f}s", fg=typer.colors.GREEN)
-
 
 
 if __name__ == "__main__":
