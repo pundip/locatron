@@ -49,6 +49,39 @@ Build-time and query-time normalisation drifting apart produces silent misses
 that look like bad data rather than a bug. This is the single most important
 rule in the project.
 
+#### The one exception: street type spellings
+
+`locatron/parse/street.py` holds `TYPE_SPELLINGS`, a hand-written table mapping
+G-NAF street type codes to the spellings an input might use (`DR` → `DRIVE`,
+`CR` → `CRESCENT`, `AV` → `AVENUE`/`AVE`).
+
+It exists because G-NAF ships street types as codes and
+`sql/build_locatron_street.sql` stores them unchanged, so the key for Clifton
+Park Drive is `CLIFTON PARK DR` and the spelled form is absent from the data.
+`normalize()` cannot bridge that, and fuzzy matching must not: Jaro-Winkler
+scores `HAMILTON CRESCENT` at 92.94 against `HAMILTON CR`, `HAMILTON CT` and
+`HAMILTON ST` alike. ReferenceDB has no street-type authority table to derive it
+from, and the build SQL applies no mapping, so it is written by hand.
+
+This is not a second normalisation path, and the distinction is what keeps it
+safe:
+
+- It is consulted only for the **trailing token** of a street candidate.
+- It **generates alternative readings**, never rewrites a string. A destructive
+  `DRIVE` → `DR` would corrupt `THE HORSLEY DRIVE`, whose *name* is
+  `THE HORSLEY DRIVE` with a blank type — 46 keys end in ` DRIVE`, 319 in
+  ` ROAD`, 127 in ` AVENUE`, and those are names.
+- It is **never applied to a stored key or a norm_key**. No column in the
+  database depends on it, so changing it needs no `NORM_VERSION` bump, no
+  normalize pass and no cache flush.
+- `normalize()` is untouched.
+
+`tests/parse/test_street.py` asserts the table covers every distinct
+`street_type` in `locatron_street`, so a new code from an upstream refresh fails
+loudly rather than silently mismatching. Seven codes (`BA`, `BIDI`, `CLR`,
+`CNTN`, `CNWY`, `CRF`, `VLLA`) are accepted as written only, because their
+expansion is not derivable from anything in ReferenceDB.
+
 ### Resolution never raises for unresolvable input
 
 Return HTTP 200 with `granularity: "unresolved"` and `confidence: 0`. Downstream

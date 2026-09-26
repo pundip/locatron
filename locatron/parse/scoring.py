@@ -238,3 +238,37 @@ def confidence(score: float, runner_up: float | None, w: Weights = DEFAULT_WEIGH
 
     margin = max(0.0, (score - runner_up) / score)
     return absolute * (1.0 - w.ambiguity_penalty_max * (1.0 - min(margin, 1.0)))
+
+
+# ---------------------------------------------------------------------------
+# street matching
+# ---------------------------------------------------------------------------
+
+#: Levenshtein similarity a street NAME must reach, 0-100, after the type has
+#: been settled by the table rather than by similarity.
+#:
+#: Set from the near-miss table. The tightest true positive is a two-character
+#: transposition in a short name -- 'SMTIH ST' against SMITH ST scores 60.00,
+#: because Levenshtein counts both moved characters in a five-letter name. The
+#: closest false positive on the same data is 'CLIFTON STREET' reaching
+#: CLIFTON GR at 75.00 on its name alone, which is a type mismatch and handled
+#: by TYPE_MISMATCH_PENALTY rather than by this threshold.
+#:
+#: 58 keeps the transposition and still rejects unrelated names, which cluster
+#: in the 30s and 40s. It is deliberately low because the type carries most of
+#: the discrimination: the cost of a loose name threshold is a penalised
+#: candidate the joint score can discard, while the cost of a tight one is a
+#: misspelled street silently becoming locality-only.
+NAME_SIMILARITY_MIN = 58.0
+
+#: Applied when the name matched but the type did not, and no same-name street
+#: in that locality carries the input's type. 'Richmond Road' in Carrum Downs
+#: reaches RICHMOND AV this way.
+#:
+#: Bounded from both sides by real cases. It must be small enough that an exact
+#: name with the wrong type beats a poor name with no type: 'CLIFTON STREET'
+#: should reach CLIFTON GR (name 100.00) rather than CLIFTON PARK DR (64.29), so
+#: the penalty has to stay under 0.36. It must be large enough that an exact-type
+#: match is never displaced by a mismatch on a marginally better name. 0.30 sits
+#: in that band with room either side.
+TYPE_MISMATCH_PENALTY = -0.30
