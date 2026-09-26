@@ -38,3 +38,14 @@ uv run locatron golden                          # accuracy against the golden se
 1. `sql/build_locatron_street.sql`
 2. `sql/build_locatron_locality.sql`
 3. `scripts/normalize_pass.py`
+4. `scripts/dedupe_locality.py`
+
+Steps 3 and 4 need the `locatron_build` credentials; the service user has no
+write grant on the gazetteer tables. Step 4 groups on the `norm_key` that step
+3 populates, so the order between them is not interchangeable. Preview it with
+`--dry-run` first:
+
+```bash
+uv run python scripts/dedupe_locality.py --dry-run
+uv run python scripts/dedupe_locality.py
+```

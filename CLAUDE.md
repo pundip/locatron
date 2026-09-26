@@ -76,7 +76,12 @@ Databricks jobs handle a column far more gracefully than an exception.
 | `locatron_locality_alias` | alias_display, locality_id | same |
 
 Rebuild order: street, then locality (locality reads street counts), then
-`scripts/normalize_pass.py`.
+`scripts/normalize_pass.py`, then `scripts/dedupe_locality.py`.
+
+`dedupe_locality.py` must run last, and after the normalize pass rather than
+before it: it groups on `norm_key`, which does not exist until that pass fills
+it in. That ordering is what lets it collapse punctuation variants without
+folding punctuation in SQL.
 
 ## Architecture
 
@@ -157,7 +162,9 @@ locatron/
 │   ├── cli.py                # resolve from the terminal, no HTTP needed
 │   ├── api/app.py            # :8080
 │   └── bulk/app.py           # :8081
-├── scripts/normalize_pass.py
+├── scripts/
+│   ├── normalize_pass.py
+│   └── dedupe_locality.py    # collapses punctuation-variant localities
 ├── sql/
 ├── tests/
 │   └── golden/golden.csv     # input → expected output
