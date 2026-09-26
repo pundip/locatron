@@ -231,6 +231,108 @@ install_config() {
     install_nginx
 }
 
+# ---------------------------------------------------------------------------
+# The SQLite street mirror.
+#
+# Kept in functions rather than inline because two places need it: the ordinary
+# deploy step, and the "already at <sha>" shortcut. The mirror tracks
+# locatron_street, which is rebuilt in MySQL on its own schedule, so it goes
+# stale without any commit landing. A shortcut that skipped this left the workers
+# serving an out-of-date gazetteer with nothing to say so.
+
+MIRROR=""
+MIRROR_REASON=""
+MIRROR_CHECKED=0
+
+mirror_resolve() {
+    MIRROR=$(as_app "$VENV/bin/python" -c 'from locatron.config import get_settings; print(get_settings().sqlite_file)')
+
+    # The mirror must not live inside the checkout: the `git reset --hard` in the
+    # fetch step would delete it on every deploy and the workers would then
+    # refuse to start.
+    case "$MIRROR" in
+        "$APP_DIR"/*)
+            die "LOCATRON_SQLITE_PATH resolves inside the checkout ($MIRROR). Set an absolute path outside it in $ENV_FILE, such as /opt/locatron/data/gazetteer.sqlite" ;;
+    esac
+
+    local dir
+    dir=$(dirname "$MIRROR")
+    if [[ ! -d "$dir" ]]; then
+        $SUDO install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "$dir"
+        info "created $dir"
+    fi
+}
+
+# 0 when a build is needed, 1 when the mirror is current. Sets MIRROR_REASON.
+# Cached, because the digest is a full scan of 532k rows at about 1.4s and both
+# callers would otherwise pay for it.
+mirror_needs_build() {
+    if (( MIRROR_CHECKED )); then
+        [[ -n "$MIRROR_REASON" ]]
+        return
+    fi
+    MIRROR_CHECKED=1
+    MIRROR_REASON=""
+
+    # Cheap checks first, so the digest only runs on a mirror that exists and
+    # already agrees on NORM_VERSION.
+    if [[ ! -f "$MIRROR" ]]; then
+        MIRROR_REASON="missing"
+        return 0
+    fi
+    if ! as_app "$VENV/bin/python" -c 'from locatron.db import local; local.check_mirror()' 2>/dev/null; then
+        MIRROR_REASON="stale or unreadable"
+        return 0
+    fi
+
+    # Exit 0 matches, 1 differs, 2 could not tell. The three are kept apart
+    # deliberately: treating an unreachable MySQL as "changed" would rebuild and
+    # restart services over a network blip, which on the no-new-commit path means
+    # a restart nobody asked for.
+    local rc=0
+    as_app "$VENV/bin/python" - <<'PYCHECK' >/dev/null 2>&1 || rc=$?
+import sys
+
+try:
+    from sqlalchemy import text
+
+    from locatron.build import streets
+    from locatron.db import local, mysql
+
+    meta = local.read_meta()
+    with mysql.session_scope() as s:
+        s.execute(text("SET SESSION TRANSACTION READ ONLY"))
+        digest = streets.source_digest(s)
+except Exception:
+    sys.exit(2)
+sys.exit(0 if digest.digest == meta.source_digest else 1)
+PYCHECK
+
+    case "$rc" in
+        0) return 1 ;;
+        1) MIRROR_REASON="source digest changed"; return 0 ;;
+        *) info "could not compare the source digest, leaving the mirror alone"
+           return 1 ;;
+    esac
+}
+
+build_mirror() {
+    info "rebuilding: $MIRROR_REASON"
+    as_app "$VENV/bin/locatron" build streets --quiet || die "street mirror build failed"
+    # mkstemp creates the temp file at 0600 and os.replace keeps that mode, so
+    # set it explicitly rather than inherit a private file.
+    $SUDO chown "$APP_USER:$APP_USER" "$MIRROR"
+    $SUDO chmod 0644 "$MIRROR"
+    # The check is now stale in the other direction.
+    MIRROR_CHECKED=0
+    MIRROR_REASON=""
+}
+
+# Whether the mirror step can run at all.
+mirror_available() {
+    (( ! NO_MIRROR )) && [[ -x "$VENV/bin/locatron" ]]
+}
+
 if (( CONFIG_ONLY )); then
     say "Installing config files"
     info "$CTX"
@@ -272,8 +374,23 @@ as_app git -C "$APP_DIR" reset --hard --quiet "origin/$BRANCH"
 NEW_SHA=$(as_app git -C "$APP_DIR" rev-parse HEAD)
 
 if [[ "$OLD_SHA" == "$NEW_SHA" ]] && (( ! FORCE )); then
-    info "already at ${NEW_SHA:0:7}, nothing to do (use --force to redeploy)"
-    exit 0
+    # No new commit does not mean nothing to do. The mirror tracks
+    # locatron_street, which is rebuilt in MySQL on its own schedule, so it goes
+    # stale with no commit involved. Exiting here unconditionally left the
+    # workers on an out-of-date gazetteer and said "nothing to do".
+    if ! mirror_available; then
+        info "already at ${NEW_SHA:0:7}, nothing to do (use --force to redeploy)"
+        exit 0
+    fi
+    mirror_resolve
+    if mirror_needs_build; then
+        info "already at ${NEW_SHA:0:7}, but the street mirror is $MIRROR_REASON"
+        info "continuing: rebuild it, then restart so the workers pick it up"
+    else
+        info "already at ${NEW_SHA:0:7} and the mirror is current, nothing to do"
+        info "(use --force to redeploy anyway)"
+        exit 0
+    fi
 fi
 
 info "${OLD_SHA:0:7} -> ${NEW_SHA:0:7}  $(as_app git -C "$APP_DIR" log -1 --format=%s | cut -c1-55)"
@@ -319,53 +436,12 @@ say "Building the street mirror"
 if (( NO_MIRROR )); then
     info "skipped (--no-mirror)"
 elif [[ ! -x "$VENV/bin/locatron" ]]; then
-    info "locatron entry point not installed, skipped"
+    info "skipped (locatron entry point not installed)"
 else
-    MIRROR=$(as_app "$VENV/bin/python" -c 'from locatron.config import get_settings; print(get_settings().sqlite_file)')
+    mirror_resolve
     info "mirror  $MIRROR"
-
-    # The mirror must not live inside the checkout: the `git reset --hard` above
-    # would delete it on every deploy and the workers would refuse to start.
-    case "$MIRROR" in
-        "$APP_DIR"/*)
-            die "LOCATRON_SQLITE_PATH resolves inside the checkout ($MIRROR). Set an absolute path outside it in $ENV_FILE, such as /opt/locatron/data/gazetteer.sqlite" ;;
-    esac
-
-    MIRROR_DIR=$(dirname "$MIRROR")
-    if [[ ! -d "$MIRROR_DIR" ]]; then
-        $SUDO install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "$MIRROR_DIR"
-        info "created $MIRROR_DIR"
-    fi
-
-    # Cheap checks first: the digest is a full scan of 532k rows and costs about
-    # 1.4s, so it only runs once the mirror exists and matches on version.
-    NEED_BUILD=0
-    REASON=""
-    if [[ ! -f "$MIRROR" ]]; then
-        NEED_BUILD=1; REASON="missing"
-    elif ! as_app "$VENV/bin/python" -c 'from locatron.db import local; local.check_mirror()' 2>/dev/null; then
-        NEED_BUILD=1; REASON="stale or unreadable"
-    elif ! as_app "$VENV/bin/python" - <<'PYCHECK' 2>/dev/null
-import sys
-from locatron.build import streets
-from locatron.db import local, mysql
-meta = local.read_meta()
-with mysql.session_scope() as s:
-    s.execute(__import__("sqlalchemy").text("SET SESSION TRANSACTION READ ONLY"))
-    digest = streets.source_digest(s)
-sys.exit(0 if digest.digest == meta.source_digest else 1)
-PYCHECK
-    then
-        NEED_BUILD=1; REASON="source digest changed"
-    fi
-
-    if (( NEED_BUILD )); then
-        info "rebuilding: $REASON"
-        as_app "$VENV/bin/locatron" build streets --quiet || die "street mirror build failed"
-        # mkstemp creates the temp file at 0600 and os.replace keeps that
-        # mode, so set it explicitly rather than inherit a private file.
-        $SUDO chown "$APP_USER:$APP_USER" "$MIRROR"
-        $SUDO chmod 0644 "$MIRROR"
+    if mirror_needs_build; then
+        build_mirror
     else
         info "current, not rebuilt"
     fi

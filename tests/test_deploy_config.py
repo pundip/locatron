@@ -327,3 +327,227 @@ report "$rc"
     # Only the config itself, and nothing at all in sites-enabled.
     assert "available=1" in out
     assert "enabled=0" in out
+
+
+# ---------------------------------------------------------------------------
+# the "already at <sha>" shortcut and the street mirror
+# ---------------------------------------------------------------------------
+#
+# These drive the real fetch path, which needs a git checkout, a venv and an env
+# file. All three are faked in the scenario. The venv's python and locatron are
+# stubs that answer the three questions the mirror check asks, so a test can put
+# the mirror in any state without building a 55 MB file.
+
+FETCH_PROLOGUE = r"""
+set -uo pipefail
+REPO="$1"
+
+WORK=$(mktemp -d)
+STUBS="$WORK/stubs";  mkdir -p "$STUBS"
+APP="$WORK/app"
+VENVDIR="$WORK/venv/bin"; mkdir -p "$VENVDIR"
+SYSD="$WORK/systemd"; mkdir -p "$SYSD"
+NGX="$WORK/nginx-site"
+MIRRORDIR="$WORK/mirrordata"; mkdir -p "$MIRRORDIR"
+export STUB_LOG="$WORK/calls.log"; : > "$STUB_LOG"
+
+# A checkout that is already up to date with its own origin.
+mkdir -p "$APP/deploy"
+cp "$REPO"/deploy/deploy.sh "$APP/deploy/"
+cp "$REPO"/deploy/nginx.conf "$APP/deploy/" 2>/dev/null || true
+mkdir -p "$APP/deploy/systemd"
+cp "$REPO"/deploy/systemd/locatron-*.service "$APP/deploy/systemd/" 2>/dev/null || true
+git -C "$APP" init -q
+git -C "$APP" config user.email t@t
+git -C "$APP" config user.name t
+git -C "$APP" add -A
+git -C "$APP" commit -qm base
+git -C "$APP" branch -M master
+git -C "$APP" remote add origin "$APP"
+git -C "$APP" fetch -q origin 2>/dev/null
+
+ENVF="$WORK/env"; echo "# empty" > "$ENVF"
+
+# A live nginx config carrying a real secret, so the install step behaves as it
+# would on the container rather than refusing over REPLACE_ME.
+sed "s/REPLACE_ME/abc123def4567890/g" "$REPO/deploy/nginx.conf" > "$NGX"
+
+# Stubs. sudo passes through; the rest record and obey the env.
+printf '#!/usr/bin/env bash\nexec "$@"\n' > "$STUBS/sudo"
+printf '#!/usr/bin/env bash\necho "systemctl $*" >> "$STUB_LOG"\n' > "$STUBS/systemctl"
+printf '#!/usr/bin/env bash\necho "nginx $*" >> "$STUB_LOG"\nexit 0\n' > "$STUBS/nginx"
+printf '#!/usr/bin/env bash\necho "uv $*" >> "$STUB_LOG"\n' > "$STUBS/uv"
+# The service user does not exist here, so ownership calls are recorded only.
+printf '#!/usr/bin/env bash\necho "chown $*" >> "$STUB_LOG"\n' > "$STUBS/chown"
+printf '#!/usr/bin/env bash\necho "chmod $*" >> "$STUB_LOG"\n' > "$STUBS/chmod"
+chmod +x "$STUBS"/sudo "$STUBS"/systemctl "$STUBS"/nginx "$STUBS"/uv
+chmod +x "$STUBS"/chown "$STUBS"/chmod
+export PATH="$STUBS:$PATH"
+
+# The venv's python answers the three mirror questions.
+#   MIRROR_PATH      what sqlite_file resolves to
+#   CHECK_MIRROR_RC  exit code for local.check_mirror()
+#   DIGEST_RC        0 match, 1 differ, 2 could not tell
+cat > "$VENVDIR/python" <<'PYSTUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-c" ]]; then
+    case "$2" in
+        *sqlite_file*) echo "$MIRROR_PATH"; exit 0 ;;
+        *check_mirror*) echo "python check_mirror" >> "$STUB_LOG"; exit "${CHECK_MIRROR_RC:-0}" ;;
+    esac
+fi
+if [[ "${1:-}" == "-" ]]; then
+    cat > /dev/null
+    echo "python digest" >> "$STUB_LOG"
+    exit "${DIGEST_RC:-0}"
+fi
+echo "python $*" >> "$STUB_LOG"
+PYSTUB
+cat > "$VENVDIR/locatron" <<'LCSTUB'
+#!/usr/bin/env bash
+echo "locatron $*" >> "$STUB_LOG"
+if [[ "${1:-}" == "build" ]]; then
+    : > "$MIRROR_PATH"
+fi
+exit 0
+LCSTUB
+chmod +x "$VENVDIR/python" "$VENVDIR/locatron"
+
+export MIRROR_PATH="$MIRRORDIR/gazetteer.sqlite"
+
+run_deploy() {
+    LOCATRON_APP_DIR="$APP" \
+    LOCATRON_VENV="$WORK/venv" \
+    LOCATRON_ENV_FILE="$ENVF" \
+    LOCATRON_SYSTEMD_DIR="$SYSD" \
+    LOCATRON_NGINX_SITE="$NGX" \
+    LOCATRON_BRANCH=master \
+    bash "$APP/deploy/deploy.sh" "$@" 2>&1
+}
+
+report() {
+    printf '\n----RC----\n%s\n----CALLS----\n' "$1"
+    cat "$STUB_LOG"
+    printf '%s\n' '----END----'
+}
+"""
+
+
+def _run_fetch(scenario: str) -> tuple[int, str, str]:
+    proc = subprocess.run(
+        ["bash", "-c", FETCH_PROLOGUE + scenario, "bash", _repo_posix()],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"harness failed:\n{proc.stdout}\n{proc.stderr}"
+    body, _, rest = proc.stdout.partition("----RC----")
+    rc_text, _, rest = rest.partition("----CALLS----")
+    calls, _, _ = rest.partition("----END----")
+    return int(rc_text.strip()), body, calls.strip()
+
+
+def test_up_to_date_with_a_fresh_mirror_exits_early() -> None:
+    """The shortcut still exists. Nothing is rebuilt and nothing restarts."""
+    rc, out, calls = _run_fetch(
+        r"""
+: > "$MIRROR_PATH"
+export CHECK_MIRROR_RC=0 DIGEST_RC=0
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "the mirror is current, nothing to do" in out
+    assert "locatron build streets" not in calls
+    assert "systemctl restart" not in calls
+
+
+def test_up_to_date_with_a_missing_mirror_builds_and_restarts() -> None:
+    """The bug: no new commit does not mean nothing to do."""
+    rc, out, calls = _run_fetch(
+        r"""
+rm -f "$MIRROR_PATH"
+export CHECK_MIRROR_RC=0 DIGEST_RC=0
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "but the street mirror is missing" in out
+    assert "locatron build streets" in calls
+
+
+def test_up_to_date_with_a_stale_mirror_builds() -> None:
+    """A NORM_VERSION mismatch is a rebuild reason with no commit involved."""
+    rc, out, calls = _run_fetch(
+        r"""
+: > "$MIRROR_PATH"
+export CHECK_MIRROR_RC=1 DIGEST_RC=0
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "stale or unreadable" in out
+    assert "locatron build streets" in calls
+
+
+def test_up_to_date_with_a_changed_source_digest_builds() -> None:
+    """locatron_street rebuilt in MySQL, no commit. This is the case the
+    shortcut used to hide."""
+    rc, out, calls = _run_fetch(
+        r"""
+: > "$MIRROR_PATH"
+export CHECK_MIRROR_RC=0 DIGEST_RC=1
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "source digest changed" in out
+    assert "locatron build streets" in calls
+
+
+def test_an_unreachable_database_does_not_force_a_rebuild() -> None:
+    """Exit 2 means could-not-tell. Treating it as changed would rebuild and
+    restart services over a network blip."""
+    rc, out, calls = _run_fetch(
+        r"""
+: > "$MIRROR_PATH"
+export CHECK_MIRROR_RC=0 DIGEST_RC=2
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "could not compare the source digest" in out
+    assert "nothing to do" in out
+    assert "locatron build streets" not in calls
+
+
+def test_no_mirror_flag_keeps_the_old_shortcut() -> None:
+    rc, out, calls = _run_fetch(
+        r"""
+rm -f "$MIRROR_PATH"
+rc=0; run_deploy --no-mirror || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "nothing to do" in out
+    assert "locatron build streets" not in calls
+
+
+def test_the_digest_is_computed_once_not_twice() -> None:
+    """Both the shortcut and the mirror step ask. The answer is cached, because
+    the digest is a full scan of 532k rows."""
+    rc, out, calls = _run_fetch(
+        r"""
+: > "$MIRROR_PATH"
+export CHECK_MIRROR_RC=0 DIGEST_RC=1
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert calls.count("python digest") == 1, calls
