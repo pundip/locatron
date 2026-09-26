@@ -116,3 +116,58 @@ def test_oserror_from_candidate_is_skipped(isolated: Path, monkeypatch: pytest.M
     monkeypatch.setattr(Path, "is_file", denied)
 
     assert config.env_files() == []
+
+
+# ---------------------------------------------------------------------------
+# sqlite_file: where the street mirror actually is
+# ---------------------------------------------------------------------------
+
+
+def test_a_relative_sqlite_path_resolves_against_the_repo_not_the_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Resolving against the cwd meant the mirror was found or not depending on
+    which directory the command ran from."""
+    monkeypatch.setenv("LOCATRON_SQLITE_PATH", "./data/gazetteer.sqlite")
+    config.get_settings.cache_clear()
+    from_repo = config.get_settings().sqlite_file
+
+    monkeypatch.chdir(tmp_path)
+    config.get_settings.cache_clear()
+    from_elsewhere = config.get_settings().sqlite_file
+
+    assert from_repo == from_elsewhere
+    assert from_repo.is_absolute()
+    assert from_repo == (config.REPO_ROOT / "data" / "gazetteer.sqlite").resolve()
+    assert from_repo.name == "gazetteer.sqlite"
+
+
+def test_an_absolute_sqlite_path_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The container sets /opt/locatron/data/gazetteer.sqlite and must get it
+    back unchanged. On Windows that string is not `is_absolute()` for want of a
+    drive letter, so a leading slash counts too or the container's own path would
+    be rebased onto whatever drive was current."""
+    monkeypatch.setenv("LOCATRON_SQLITE_PATH", "/opt/locatron/data/gazetteer.sqlite")
+    config.get_settings.cache_clear()
+    assert config.get_settings().sqlite_file.as_posix() == "/opt/locatron/data/gazetteer.sqlite"
+
+
+def test_the_default_sqlite_path_is_outside_any_checkout() -> None:
+    """A mirror inside the checkout is deleted by deploy.sh's `git reset --hard`,
+    after which the workers refuse to start."""
+    config.get_settings.cache_clear()
+    defaults = config.Settings()
+    assert defaults.sqlite_path.startswith("/opt/locatron/")
+    assert "app" not in defaults.sqlite_path.split("/")
+
+
+def test_env_example_exists_and_names_the_mirror_path() -> None:
+    """deploy/install.sh copies this file to create /opt/locatron/.env, so a
+    missing one breaks a fresh container install."""
+    # Not config.REPO_ROOT: an autouse fixture in this module repoints it at a
+    # tmp dir, and this test is about the real file on disk.
+    example = Path(__file__).resolve().parent.parent / ".env.example"
+    assert example.exists(), "install.sh:133 copies .env.example"
+    body = example.read_text(encoding="utf-8")
+    assert "LOCATRON_SQLITE_PATH=/opt/locatron/data/gazetteer.sqlite" in body
+    assert "LOCATRON_MYSQL_PASSWORD" in body

@@ -62,7 +62,7 @@ _lock = threading.Lock()
 
 
 def mirror_path() -> Path:
-    return Path(get_settings().sqlite_path)
+    return get_settings().sqlite_file
 
 
 def read_meta(path: str | Path | None = None) -> MirrorMeta:

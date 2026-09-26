@@ -312,8 +312,21 @@ if (( NO_MIRROR )); then
 elif [[ ! -x "$VENV/bin/locatron" ]]; then
     info "locatron entry point not installed, skipped"
 else
-    MIRROR=$(as_app "$VENV/bin/python" -c 'from locatron.config import get_settings; print(get_settings().sqlite_path)')
+    MIRROR=$(as_app "$VENV/bin/python" -c 'from locatron.config import get_settings; print(get_settings().sqlite_file)')
     info "mirror  $MIRROR"
+
+    # The mirror must not live inside the checkout: the `git reset --hard` above
+    # would delete it on every deploy and the workers would refuse to start.
+    case "$MIRROR" in
+        "$APP_DIR"/*)
+            die "LOCATRON_SQLITE_PATH resolves inside the checkout ($MIRROR). Set an absolute path outside it in $ENV_FILE, such as /opt/locatron/data/gazetteer.sqlite" ;;
+    esac
+
+    MIRROR_DIR=$(dirname "$MIRROR")
+    if [[ ! -d "$MIRROR_DIR" ]]; then
+        $SUDO install -d -o "$APP_USER" -g "$APP_USER" -m 0755 "$MIRROR_DIR"
+        info "created $MIRROR_DIR"
+    fi
 
     # Cheap checks first: the digest is a full scan of 532k rows and costs about
     # 1.4s, so it only runs once the mirror exists and matches on version.
@@ -339,7 +352,11 @@ PYCHECK
 
     if (( NEED_BUILD )); then
         info "rebuilding: $REASON"
-        as_app "$VENV/bin/locatron" build streets --quiet             || die "street mirror build failed"
+        as_app "$VENV/bin/locatron" build streets --quiet || die "street mirror build failed"
+        # mkstemp creates the temp file at 0600 and os.replace keeps that
+        # mode, so set it explicitly rather than inherit a private file.
+        $SUDO chown "$APP_USER:$APP_USER" "$MIRROR"
+        $SUDO chmod 0644 "$MIRROR"
     else
         info "current, not rebuilt"
     fi

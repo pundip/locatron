@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     cache_enabled: bool = True
 
     data_dir: str = "/var/lib/locatron"
-    sqlite_path: str = "/var/lib/locatron/gazetteer.sqlite"
+    sqlite_path: str = "/opt/locatron/data/gazetteer.sqlite"
 
     root_path: str = "/locatron"
     log_level: str = "INFO"
@@ -159,6 +159,26 @@ class Settings(BaseSettings):
         # would evaluate them once at import. An explicit _env_file still wins.
         values.setdefault("_env_file", env_files())
         super().__init__(**values)
+
+    @property
+    def sqlite_file(self) -> Path:
+        """`sqlite_path` as an absolute path.
+
+        A relative value resolves against the repo root, not the working
+        directory. Resolving against cwd meant the mirror was found or not
+        depending on where the command was run from, and on the container it
+        would have landed inside the git checkout, where a `git reset --hard`
+        during deploy can remove it. Dev keeps a relative path in .env for
+        convenience; production sets an absolute one outside the checkout.
+        """
+        raw = Path(self.sqlite_path).expanduser()
+        # A leading slash counts as absolute on every platform. On Windows
+        # Path('/opt/...').is_absolute() is False because there is no drive
+        # letter, which would silently rebase the container's own path onto
+        # whatever drive happened to be current.
+        if raw.is_absolute() or self.sqlite_path.startswith("/"):
+            return raw
+        return (REPO_ROOT / raw).resolve()
 
     @property
     def mysql_url(self) -> str:

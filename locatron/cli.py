@@ -547,7 +547,7 @@ def build_streets(
     """
     from locatron.build import streets as build_streets_mod
 
-    target = path or get_settings().sqlite_path
+    target = path or str(get_settings().sqlite_file)
     typer.echo(f"Source  locatron_street @ {get_settings().mysql_host}")
     typer.echo(f"Target  {target}")
 
