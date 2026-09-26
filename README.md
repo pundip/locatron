@@ -42,10 +42,10 @@ uv run locatron golden                          # accuracy against the golden se
 
 Steps 3 and 4 need the `locatron_build` credentials; the service user has no
 write grant on the gazetteer tables. Step 4 groups on the `norm_key` that step
-3 populates, so the order between them is not interchangeable. Preview it with
-`--dry-run` first:
+3 populates, so the order between them is not interchangeable. Step 4 reports by
+default and writes only with `--apply`:
 
 ```bash
-uv run python scripts/dedupe_locality.py --dry-run
-uv run python scripts/dedupe_locality.py
+uv run python scripts/dedupe_locality.py           # report, writes nothing
+uv run python scripts/dedupe_locality.py --apply   # make the changes
 ```

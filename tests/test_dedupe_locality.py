@@ -201,3 +201,58 @@ def test_every_dropped_row_is_accounted_for(n_dropped: int) -> None:
     plan = dedupe._plan_from_rows([g], aliases)
     assert len(plan.remap) == n_dropped
     assert plan.delete == []
+
+
+# ---------------------------------------------------------------------------
+# the write is opt-in
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stubbed(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """main() with the database and the write both replaced."""
+    calls: dict[str, Any] = {"applied": 0, "verified": 0}
+    g = _group(_row(1, in_gnaf=1), _row(2))
+
+    monkeypatch.setattr(dedupe, "load_groups", lambda: [g])
+    monkeypatch.setattr(dedupe, "plan_aliases", lambda _g: dedupe.AliasPlan([], [], []))
+    monkeypatch.setattr(
+        dedupe, "apply", lambda *_a: calls.__setitem__("applied", calls["applied"] + 1)
+    )
+    monkeypatch.setattr(
+        dedupe, "verify", lambda: calls.__setitem__("verified", calls["verified"] + 1) or True
+    )
+    return calls
+
+
+def test_bare_invocation_writes_nothing(
+    stubbed: dict[str, Any], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The reason the flag was inverted: the bare command deletes rows."""
+    monkeypatch.setattr("sys.argv", ["dedupe_locality.py"])
+    assert dedupe.main() == 0
+    assert stubbed["applied"] == 0
+    assert "Nothing written" in capsys.readouterr().out
+
+
+def test_dry_run_flag_still_writes_nothing(
+    stubbed: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.argv", ["dedupe_locality.py", "--dry-run"])
+    assert dedupe.main() == 0
+    assert stubbed["applied"] == 0
+
+
+def test_apply_flag_writes(stubbed: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("sys.argv", ["dedupe_locality.py", "--apply"])
+    assert dedupe.main() == 0
+    assert stubbed["applied"] == 1
+    assert stubbed["verified"] == 1
+
+
+def test_apply_and_dry_run_together_is_refused(
+    stubbed: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.argv", ["dedupe_locality.py", "--apply", "--dry-run"])
+    assert dedupe.main() == 1
+    assert stubbed["applied"] == 0

@@ -13,8 +13,12 @@ index sees two distinct localities where normalize() sees one. The AusPost twin
 carries no addresses and is flagged is_postal_only, which is simply wrong for a
 place that has 1,069 G-NAF addresses.
 
-    python scripts/dedupe_locality.py --dry-run
-    python scripts/dedupe_locality.py
+    python scripts/dedupe_locality.py            # report only, writes nothing
+    python scripts/dedupe_locality.py --apply    # remap, collapse, delete
+
+Reporting is the default and --apply is required to write, because the bare
+command deletes rows and a destructive default is the wrong way round for
+something that runs at the end of a rebuild.
 
 Needs the locatron_build credentials. The service user has no write grant on the
 gazetteer tables, which is deliberate. Writes only to locatron_locality and
@@ -295,18 +299,29 @@ def verify() -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually remap, collapse and delete. Without it, nothing is written.",
+    )
+    # Accepted so that spelling out the default does not fail, and so a habit of
+    # typing it cannot silently become an apply.
+    ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print what would change and write nothing.",
+        help="Report only. This is the default; the flag is accepted for clarity.",
     )
     args = ap.parse_args()
+
+    if args.apply and args.dry_run:
+        print("--apply and --dry-run contradict each other", file=sys.stderr)
+        return 1
 
     groups = load_groups()
     plan = plan_aliases(groups)
     report(groups, plan)
 
-    if args.dry_run:
-        print("\n--dry-run: nothing written.")
+    if not args.apply:
+        print("\nNothing written. Re-run with --apply to make these changes.")
         return 0
 
     if groups:
