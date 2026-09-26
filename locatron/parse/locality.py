@@ -19,9 +19,12 @@ is a first-class path here, scoring just below a direct hit.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from locatron.gazetteer.au import AuGazetteer, LocalityRow
+from locatron.normalize import ngrams
+from locatron.parse.tokens import Span, TokenStream
 from locatron.resolve.scoring import MatchKind
 
 
@@ -185,3 +188,101 @@ def fuzzy_candidates_for_key(
                 )
             )
     return _ranked(_dedupe(out))
+
+
+# ---------------------------------------------------------------------------
+# n-gram generation and consumed-span bookkeeping
+# ---------------------------------------------------------------------------
+
+#: Longest locality name worth trying. 'ST KILDA EAST' is three tokens and
+#: 'CHARLES DARWIN UNIVERSITY' is three; four covers the tail without turning
+#: every input into a combinatorial sweep.
+MAX_NGRAM_TOKENS = 4
+
+
+@dataclass(frozen=True, slots=True)
+class NGram:
+    """A contiguous run of unconsumed tokens, and the key it forms."""
+
+    span: Span
+    key: str
+
+    def __len__(self) -> int:
+        return len(self.span)
+
+
+def ngram_spans(
+    ts: TokenStream,
+    consumed: Sequence[Span] = (),
+    *,
+    max_len: int = MAX_NGRAM_TOKENS,
+) -> tuple[NGram, ...]:
+    """Every contiguous n-gram of the unconsumed tokens, longest first.
+
+    Generated within each unconsumed run rather than across the whole stream, so
+    a span never straddles a token some extractor already claimed. In
+    '65 CLIFTON PARK DRIVE 3201 CARRUM DOWNS' with the number and postcode
+    claimed, that means 'DRIVE CARRUM' is never offered as a locality key --
+    the postcode between them ends the run.
+
+    Longest first because a longer name is better evidence: 'CARRUM DOWNS' must
+    be tried before 'CARRUM', and 'ST KILDA EAST' before 'ST KILDA'.
+
+    >>> from locatron.parse.tokens import tokenize
+    >>> ts = tokenize("Carrum Downs VIC")
+    >>> [(g.key, g.span.start, g.span.end) for g in ngram_spans(ts)][:3]
+    [('CARRUM DOWNS VIC', 0, 3), ('CARRUM DOWNS', 0, 2), ('DOWNS VIC', 1, 3)]
+    """
+    out: list[NGram] = []
+    for run in ts.runs(list(consumed)):
+        texts = [t.text for t in ts.slice(run)]
+        # normalize.ngrams() already does this enumeration; reusing it keeps the
+        # n-gram definition in one place even though the offsets need shifting.
+        for start, end, joined in ngrams(texts, max_len=max_len):
+            out.append(NGram(span=Span(run.start + start, run.start + end), key=joined))
+
+    # Longest first, then left to right, so the order is total and stable.
+    return tuple(sorted(out, key=lambda g: (-len(g.span), g.span.start)))
+
+
+@dataclass(frozen=True, slots=True)
+class StateToken:
+    """A token run that names a state, cross-checked against aus_state_bucket."""
+
+    code: str
+    """The AU state code: VIC, NSW, QLD, ...."""
+    span: Span
+    key: str
+    strong: bool
+    """True when the gazetteer's `state_tokens` recognised it, meaning the input
+    really did name a state. False for a `state_hints` match, which is weak
+    evidence only -- the bucket maps bare locality names to states too, so
+    'Toronto' hits it and does not mean New South Wales was stated. See the
+    module docstring on gazetteer/au.py."""
+
+
+def find_state_tokens(
+    ts: TokenStream, au: AuGazetteer, consumed: Sequence[Span] = ()
+) -> tuple[StateToken, ...]:
+    """Every run of unconsumed tokens that names a state, longest first.
+
+    Goes through the existing loader's `state_token()` and `state_hint()`, which
+    are built from `aus_state_bucket` at load time. No new query path, and no
+    hardcoded list of state names -- the eight full names come from
+    Cities.admin_name for iso3='AUS' so they stay correct if upstream renames
+    one.
+
+    Only `strong` results should be allowed to contradict a candidate. A hint is
+    the bucket saying "this string is probably Australian", not "the input
+    stated a state".
+    """
+    out: list[StateToken] = []
+    for gram in ngram_spans(ts, consumed):
+        code = au.state_token(gram.key)
+        if code:
+            out.append(StateToken(code=code, span=gram.span, key=gram.key, strong=True))
+            continue
+        hint = au.state_hint(gram.key)
+        if hint:
+            out.append(StateToken(code=hint, span=gram.span, key=gram.key, strong=False))
+    return tuple(out)
