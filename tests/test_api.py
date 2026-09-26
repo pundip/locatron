@@ -245,6 +245,31 @@ def test_healthz_503_when_mysql_unreachable(
     assert r.json()["mysql"]["connected"] is False
 
 
+@pytest.mark.parametrize("warm", [True, False])
+def test_healthz_reports_worker_warmth(
+    client: AsgiClient, monkeypatch: pytest.MonkeyPatch, warm: bool
+) -> None:
+    """A cold worker must be visible rather than silent."""
+    monkeypatch.setattr(mysql, "health", lambda: {"connected": True})
+    monkeypatch.setattr(api, "is_warm", lambda: warm)
+    r = client.get("/healthz")
+    assert r.json()["warm"] is warm
+
+
+def test_cold_worker_is_still_healthy(client: AsgiClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Warmth must not gate the status code.
+
+    A cold worker answers correctly, just slowly. Returning 503 would pull a
+    working worker out of nginx's rotation over a latency problem.
+    """
+    monkeypatch.setattr(mysql, "health", lambda: {"connected": True})
+    monkeypatch.setattr(api, "is_warm", lambda: False)
+    r = client.get("/healthz")
+    assert r.status == 200
+    assert r.json()["status"] == "ok"
+    assert r.json()["warm"] is False
+
+
 def test_healthz_is_not_logged(client: AsgiClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mysql, "health", lambda: {"connected": True})
     with capture_logs() as logs:

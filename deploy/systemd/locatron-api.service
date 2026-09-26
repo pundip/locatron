@@ -11,6 +11,7 @@ Group=locatron
 WorkingDirectory=/opt/locatron/app
 EnvironmentFile=/opt/locatron/.env
 ExecStart=/opt/locatron/venv/bin/gunicorn locatron.api.app:app \
+    -c /opt/locatron/app/deploy/gunicorn.conf.py \
     --worker-class uvicorn.workers.UvicornWorker \
     --workers 4 \
     --bind 127.0.0.1:8080 \

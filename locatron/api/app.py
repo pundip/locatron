@@ -30,6 +30,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from locatron.config import get_settings
 from locatron.db import mysql
+from locatron.gazetteer.warm import is_warm
 from locatron.normalize import normalize
 from locatron.resolve.pipeline import resolve_one, unresolved
 from locatron.schemas import (
@@ -240,12 +241,25 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz", tags=["ops"])
     def healthz() -> JSONResponse:
-        """Liveness plus MySQL reachability. 503 when MySQL is unreachable."""
+        """Liveness plus MySQL reachability. 503 when MySQL is unreachable.
+
+        `warm` reports whether this worker's gazetteers are loaded. It
+        deliberately does not affect the status code: a cold worker answers
+        correctly, just slowly, so failing the check would pull a healthy
+        worker out of rotation over a latency problem. It is here to make a
+        cold worker visible — every reply should read warm=true once
+        deploy/gunicorn.conf.py has done its job.
+        """
         db = mysql.health()
         ok = bool(db.get("connected"))
         return JSONResponse(
             status_code=200 if ok else 503,
-            content={"status": "ok" if ok else "degraded", "version": __version__, "mysql": db},
+            content={
+                "status": "ok" if ok else "degraded",
+                "version": __version__,
+                "warm": is_warm(),
+                "mysql": db,
+            },
         )
 
     @app.get("/v1/resolve", response_model=ResolveResponse, tags=["resolve"])
