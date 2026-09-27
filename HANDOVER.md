@@ -196,6 +196,7 @@ uv run locatron schema                 # inspect table structure
 uv run locatron sample Cities -n 5     # see real values, not just types
 uv run locatron norm "Greater Melbourne"
 uv run locatron resolve "Greater Melbourne"
+uv run locatron resolve --file inputs.txt --out results.csv   # batch, one per line
 uv run locatron parse "12 Clifton Street 3201"
 uv run locatron golden                 # accuracy against the golden set
 ```
@@ -262,6 +263,29 @@ Cloudflare bot protection returns 403 to non-browser user agents on
 rule scoped to a source IP or an API key header.
 Edge access log shows Cloudflare IPs rather than real clients. Add
 Cloudflare `real_ip` config.
+A full state name can fuzzy-match an unrelated suburb on the world path.
+`Western Australia` answers locality `WESTMERE` with admin1 `VIC` at confidence
+0.61 — a Victorian suburb for a Western Australian state name, and the wrong
+state into the bargain. `South Australia` behaves the same way. Pre-existing
+phase-1 behaviour, unrelated to routing: these inputs carry no address signal, so
+they never reach the AU path, and the AU path's own gate already refuses this
+class of match (see the Routing section of `CLAUDE.md`). The world path has no
+equivalent rule. The fix is probably to stop a fuzzy locality outranking a
+`state_bucket` hit when the input is exactly a state name, which is the world-path
+analogue of `Span.within()`. Not urgent — `VIC`, `Victoria Australia`,
+`New South Wales`, `Queensland`, `Tasmania` and `Northern Territory` all answer
+`admin1` correctly, and `golden.csv` covers those — but it is wrong, and someone
+will report it.
+An unresolvable input costs about 23 ms in the world fuzzy sweep. `asdfghjkl`
+measures p50 23.4 ms, p95 29.1 ms, against 0.10 ms for `Delhi`; any string that
+matches nothing exactly pays the same, because the sweep runs rapidfuzz across
+~48k cities and only runs when nothing matched. That is the wrong way round for
+bulk: a LinkedIn scrape is full of `Remote`, `Work from home` and worse, so the
+slowest inputs are the ones a batch has most of. 200k junk rows is about 80
+minutes of fuzzy matching. The AU path had the same shape and was fixed by
+skipping the sweep unless the input looks like an address (see
+`locatron/resolve/au.py`); the world path needs its own version of that
+reasoning, plus the resolve cache, which does not exist yet.
 ---
 Companion documents
 `CLAUDE.md` in the repo — invariants and data traps, read by Claude Code
