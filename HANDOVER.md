@@ -1,5 +1,5 @@
 Locatron handover
-State as of 26 September 2026. Written to start a fresh conversation without
+State as of 27 September 2026. Written to start a fresh conversation without
 replaying the build history.
 ---
 What Locatron is
@@ -12,7 +12,7 @@ resolve by population, so "Delhi" is India, not California. Built and
 deployed.
 Australian address to a fully formatted G-NAF record. "65 clifton park
 drive 3201 carrum downs" returns every G-NAF field. Australian addresses
-only. Not started. This is the next phase.
+only. Built and deployed.
 Bulk export feeding Databricks and other consumers, as a separate API
 process. Not started.
 `CLAUDE.md` at the repo root holds the architecture decisions and invariants.
@@ -27,11 +27,24 @@ POST /locatron/v1/resolve
 POST /locatron/v1/resolve/batch
 GET  /locatron/docs
 ```
-Performance: 0.6ms median server-side resolve once warm. All four gunicorn
-workers load gazetteers at startup via a `post_worker_init` hook, so there is
-no cold-start penalty on the request path. About 106ms of the user-visible
-latency is network (Melbourne to Cloudflare to Sydney to home NAT), which is
-mostly unavoidable and is the argument for the batch endpoint.
+Both resolve paths are live. `tests/golden/golden.csv` is 35 rows and passes
+35/35; the suite is 1030 tests.
+
+Performance, server-side and in-process, from `scripts/resolve_bench.py`:
+
+| Path | p50 | p95 |
+|---|---|---|
+| world place | 1.0 ms | 5.7 ms |
+| AU locality / postcode | 2.8 ms | 12.5 ms |
+| AU address | 15.8 ms | 33.3 ms |
+
+The AU address figure includes a real MySQL round trip, and MySQL is external, so
+it moves with where you measure from. Routing costs a world answer about 0.6 ms at
+p50. All four gunicorn workers load gazetteers at startup via a
+`post_worker_init` hook, so there is no cold-start penalty on the request path.
+About 106ms of the user-visible latency is network (Melbourne to Cloudflare to
+Sydney to home NAT), which is mostly unavoidable and is the argument for the batch
+endpoint.
 Repo layout
 ```
 locatron/
@@ -46,18 +59,23 @@ locatron/
 │   ├── cli.py                    check, schema, sample, norm, resolve, golden
 │   ├── db/mysql.py
 │   ├── gazetteer/                loader, countries, cities, au
-│   ├── resolve/                  pipeline, scoring, world
-│   ├── parse/                    EMPTY — phase 2 goes here
+│   ├── resolve/                  pipeline, au, world, scoring, unresolved
+│   ├── parse/                    tokens, components, locality, street, lookup, scoring
+│   ├── build/                    streets.py, the SQLite mirror build
+│   ├── db/local.py               the street mirror
 │   ├── api/app.py
 │   └── bulk/                     EMPTY — phase 3
 ├── scripts/
 │   ├── normalize_pass.py
+│   ├── dedupe_locality.py
+│   ├── route_probe.py            which path each golden row takes, and why
+│   ├── resolve_bench.py          server-side latency per path
 │   ├── latency_check.py
 │   └── git-hooks/pre-commit      blocks committing secrets
 ├── sql/                          build scripts for derived tables
 ├── deploy/                       install.sh, deploy.sh, nginx.conf, systemd
 ├── prompts/01-gazetteer-world-resolver.md
-└── tests/golden/golden.csv       30 rows, the accuracy target
+└── tests/golden/golden.csv       35 rows, the accuracy target
 ```
 Database
 MySQL 8 at `pundip.com:3335`, database `ReferenceDB`.
@@ -102,60 +120,71 @@ shape for a feedback table, and it is also why no test may write to it — see
 call site to opt out. On `locatron_api_key` it has UPDATE only, not INSERT, so
 creating a key is a manual operation too.
 ---
-Phase 2: the AU address parser
-The remaining substantial work. Everything below is design already settled.
-The approach
-Not a positional regex. The parser generates multiple parse hypotheses and
-validates each against the gazetteer, keeping the best.
-Worked example, `65 clifton park drive 3201 carrum downs`. Tokens:
-`[65, CLIFTON, PARK, DRIVE, 3201, CARRUM, DOWNS]`. Note the postcode precedes
-the locality, so a positional parser breaks here.
-Find 4-digit tokens that validate against known postcodes. `3201` does,
-`65` does not.
-Match locality by testing token n-grams against `locatron_locality`.
-`CARRUM DOWNS` hits, and it agrees with postcode 3201, which is strong
-evidence the parse is right.
-State falls out of the locality, cross-checked against `aus_state_bucket`.
-Extract unit and level (`5/12`, `UNIT 5`, `L 3`) and street number,
-including ranges (`14-40`) and alpha suffixes (`6C` — note G-NAF stores the
-suffix inside `NUMBER_FIRST` in this table).
-Remaining tokens are the street. This is where the gazetteer earns its keep:
-`PARK` is itself a valid street type, so a naive right-to-left type match
-gives street name `CLIFTON`, type `PARK`, leftover `DRIVE`. But the locality
-is already known, so pull that locality's streets from `locatron_street` and
-fuzzy match. `CLIFTON PARK DRIVE` wins outright.
-Hit `address_ref` on the composite index for the full record.
-Tie-breaking on the final lookup: prefer `ALIAS_PRINCIPAL = 'PRINCIPAL'`; if a
-unit was supplied match `FLAT_NUMBER`, otherwise prefer the `PRIMARY` row.
-Graceful degradation matters as much as exact matching. No number match falls
-back to the street centroid (`granularity: street`); no street falls back to the
-locality centroid (`granularity: locality`). PO boxes never match G-NAF at all
-— `locatron_locality.is_postal_only = 1` is the signal, and they return
-`granularity: postal`.
-Fuzzy matching rule
-Fuzzy match at gazetteer level, exact match at address level. Localities (~18k)
-and cities (~48k) are small enough for rapidfuzz in memory. The 15.9M-row
-address table is only ever hit with exact, index-backed lookups. Never fuzzy
-match across `address_ref`.
-Acceptance
-`tests/golden/golden.csv` has the AU rows already written with a `note` column
-explaining what each probes. Phase 2 makes these pass:
-the two `65 Clifton Park Dr` orderings
-`5/12 Smith Street Fitzroy VIC 3065` and its spelled-unit variant
-`14-40 Wills Street Melbourne VIC 3000` (number range)
-`Clifton Park Drive Carrum Downs` (street fallback)
-`Carrum Downs VIC` (locality only)
-`3201` (bare postcode)
-`PO Box 45 World Square NSW 2002` (postal only)
-`Hamilton Crescent Ryde NSW 2112` (exercises a merged street variant)
-The world-place rows already pass. Do not regress them.
-Prompt template
-`prompts/01-gazetteer-world-resolver.md` has both the phase 1 prompt and a
-reusable template at the bottom. The parts that make it work: an explicit
-out-of-scope list, an instruction to inspect the schema rather than guess, and
-numbered review points so you get four small diffs instead of one huge one.
-For phase 2, review the hypothesis-scoring logic closely. That is where subtle
-wrongness hides.
+Phase 2: the AU address parser — built
+`CLAUDE.md` carries the design in full: the Routing section says how an input is
+sent down one path or the other, the Granularity mapping section says how the
+parser's five rungs become the nine response values, and the response envelope
+section says what comes back. What follows is only what a newcomer needs to find
+their way around.
+The shape of it
+Not a positional regex. The parser generates multiple readings and validates each
+against the gazetteer, keeping the best. `65 clifton park drive 3201 carrum downs`
+puts the postcode before the locality, which is why.
+Stages, each its own module under `locatron/parse/`: `tokens` splits, `components`
+pulls out postcodes, units, street numbers and PO boxes, `locality` proposes
+localities from token n-grams, `street` matches streets from the SQLite mirror,
+and `lookup` does the one exact dive into `address_ref`. `locatron/resolve/au.py`
+runs them and shapes an answer; `resolve/pipeline.py` chooses between that and the
+world path.
+Two commands make it inspectable without deploying anything:
+```bash
+uv run locatron parse "65 clifton park drive 3201 carrum downs"   # every stage
+uv run python scripts/route_probe.py                              # route per golden row
+uv run python scripts/route_probe.py --confidence                 # the calibration table
+```
+Where to be careful
+The hypothesis scoring is where subtle wrongness hides, and every weight in
+`parse/scoring.py` carries a comment saying what real case fixed its value. Change
+one and run `route_probe.py` before and after: it prints the route and landing
+granularity for all 35 golden rows and 19 probe cases, and a rule that looks
+reasonable in isolation regularly moves something else.
+---
+What the build taught us
+Four things cost real time. They are here because each of them looked like
+something else at first.
+A deploy that fetches is not a deploy that happened. `deploy.sh` compared the
+checkout against origin to decide there was nothing to do. A deploy that fetched
+and then failed before the restart left the checkout matching origin with the
+services on the previous commit, so every later run reported nothing to do and
+changed nothing — production ran a day stale, and nothing in the repo could tell
+you, because the checkout looked perfect. Now `/opt/locatron/.deployed-sha`
+records what actually restarted, and `--status` answers the question without
+deploying.
+Then the fix for that got deployed by a run that half-applied it: bash reads a
+script incrementally, so the fetch that brought in the recording code was followed
+by the tail bash had already buffered, which had none of it. deploy.sh now
+re-execs itself when a fetch changes it.
+`SET SESSION TRANSACTION READ ONLY` outlives the query. The G-NAF lookups issued
+it on a connection borrowed from the shared pool, so it stayed set when the
+connection went back, and the next `locatron_unresolved` write on that connection
+failed. The write is best effort, so it was logged and swallowed and the feedback
+table simply stayed empty — intermittently, depending on pool checkout order.
+There are two pools now. The general lesson: a session-scoped setting on a pooled
+connection is a side effect on every later borrower.
+Golden rows have to come from the data. Three of the AU addresses in `golden.csv`
+were written from imagination and did not exist in G-NAF — `12 Smith St Fitzroy`
+is not a thing; that street runs 1, 3, 5, 7, 7A, 9, 11, 11A, 13, 15 through that
+stretch. The parser was degrading to `street` entirely correctly and it read as a
+parser bug. They were replaced with rows verified against `address_ref`, and each
+note now says why. `CLAUDE.md` already said to grow the set from
+`locatron_unresolved` rather than from imagination; this is what it costs when you
+do not.
+A test that writes to a real table will. Before the guard in `tests/conftest.py`,
+suite runs filed nine synthetic rows into `locatron_unresolved` — and the service
+account has no DELETE on it, so they needed a DBA to remove. Per-call-site opt-out
+was not enough: 35 `resolve_one()` calls did not pass the flag and the API tests
+could not. The guard is autouse now.
+---
 ---
 Machines and conventions
 Three machines. State which one a command runs on, because the same command
@@ -253,33 +282,55 @@ the primary key covers fewer, so `('HAMILTON','CR')` and `('HAMILTON CR','')`
 both produce `HAMILTON CR`. Aggregate to variant level first, then collapse
 with an explicit tiebreak.
 G-NAF postcodes lose leading zeros on careless loads. NT is 0800 to 0899.
-`LPAD(TRIM(POSTCODE),4,'0')` everywhere.
+`LPAD(TRIM(POSTCODE),4,'0')` when **building** a derived table, and never in a
+WHERE against `address_ref`: its POSTCODE is already four characters on every
+row, and wrapping the indexed column turns a 1 ms index dive into a 10.6 s full
+scan.
 G-NAF has no PO Boxes. Postal addresses resolve via
 `locatron_locality.is_postal_only = 1`.
 `address_ref` uses blank strings, not NULLs. `NULLIF(TRIM(col),'')` before any
 NULL check.
 `STATE` includes `OT` for external territories. Exclude it from Australian
 bounding-box sanity checks.
-Alias rows in G-NAF (`ALIAS_PRINCIPAL = 'ALIAS'`) point at their principal via
-`PRINCIPAL_PID`. Exclude them from canonical aggregates; use them to seed
-aliases.
+Alias rows in G-NAF point at their principal via `PRINCIPAL_PID`. The indicator
+values are single letters, not words: `ALIAS_PRINCIPAL` is `'P'` or `'A'`, so
+querying `= 'ALIAS'` matches nothing and returns silently. Exclude them from
+canonical aggregates; use them to seed aliases. A resolve that lands on one
+returns the alias row itself — it carries the street and number the input used —
+with `canonical_pid` and `principal` naming the row G-NAF considers canonical.
 ---
 Outstanding
-Not blocking phase 2.
+Phase 3 (bulk export) is the next substantial piece; none of these block it.
 Shared secret not rotated. The `X-Locatron-Edge` value was pasted into a
 chat. Deliberately deferred until the build settles. Rotate on the container
 in `/etc/nginx/sites-available/locatron` and in both edge nginx blocks.
-nginx.conf reinstalls on every deploy. The comparison happens before the
-secret substitution so the files always differ. Fix in progress.
 AU gazetteer load is slow. 3.4s for 16,228 entries against 1.8s for
 44,342 cities, roughly seven times slower per entry. And 16,228 looks low
 against 18,567 localities plus 61,155 aliases. Probably more round trips than
 needed. Off the request path now, so not urgent, but it is 60% of a 5.5s
 startup.
-`locatron_unresolved` is empty. Nothing has run through it yet. Once
-phase 2 lands, push a few thousand real LinkedIn strings through the CLI and
-review the top entries by `hit_count`. Promoting those into
-`locatron_locality_alias` is the flywheel that makes this good over months.
+`locatron_unresolved` has no real traffic in it. It holds nine synthetic rows
+written by test runs before `tests/conftest.py` blocked that; all nine are marked
+`reviewed = 1` so they are out of the triage queue, and removing them needs
+`locatron_build` or a DBA, because the service account has INSERT and UPDATE on
+that table but not DELETE. The flywheel is the next thing worth doing:
+
+```bash
+uv run locatron resolve --file linkedin-strings.txt --out results.csv
+```
+
+Push a few thousand real scraped strings through, review the table by
+`hit_count`, and promote the genuine entries into `locatron_locality_alias`. That
+loop is what makes this good over months, and nothing has turned it yet.
+No resolve cache. `config.py`, `.env.example` and `MatchMethod.CACHE` are all
+placeholders; there is no `cache.py` and nothing has ever been written to Redis.
+When one is added its key must carry both `NORM_VERSION` and a `PARSER_VERSION` —
+see the Architecture section of `CLAUDE.md`. It is also the obvious answer to the
+23 ms unresolvable-input cost below.
+Sub-dwelling vocabulary is deliberately narrow. `parse/components.py` knows
+UNIT, FLAT, APARTMENT and the slash form; G-NAF's `FLAT_TYPE` has about thirty
+more. Each keyword added is a token taken away from the street name, so they go in
+on evidence from `locatron_unresolved`, not on guesswork.
 API keys not wired up. Table exists, no code. Access is currently gated
 only by the shared-secret header at nginx. Planned as a table plus three CLI
 commands, no web UI.
