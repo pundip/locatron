@@ -522,7 +522,12 @@ def _token_roles(ts, winner, boxes, units, postcodes, numbers) -> list[str]:
         # A token the winner used as the postcode is not also the number.
         if pc_span is not None and n.span == pc_span:
             continue
-        claim(n.span, f"number {n.number_first}")
+        # Both halves of a range. Printing only number_first made '14-40' read as
+        # "number 14", which looked exactly like the range having been lost on the
+        # way to the lookup. It had not -- the lookup receives both -- but a
+        # report that says 14 when the token says 14-40 invites that conclusion.
+        span_label = n.number_first + (f"-{n.number_last}" if n.number_last else "")
+        claim(n.span, f"number {span_label}")
 
     lines = ["roles (winner)"]
     for t in ts:

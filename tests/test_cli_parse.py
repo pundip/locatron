@@ -225,3 +225,51 @@ def test_parse_shows_the_confidence_cap_on_a_substituted_type() -> None:
     assert result.exit_code == 0, result.output
     assert "confidence   capped at 0.7" in result.output
     assert "street type substituted" in result.output
+
+
+@needs_stores
+@pytest.mark.parametrize(
+    ("raw", "token", "role"),
+    [
+        # Both halves survive role assignment, whether or not the range resolves.
+        ("14-40 Wills Street Melbourne VIC 3000", "14-40", "number 14-40"),
+        ("17-23 Wills Street Melbourne VIC 3000", "17-23", "number 17-23"),
+        ("1A-1C Smith Street Fitzroy VIC 3065", "1A-1C", "number 1A-1C"),
+        # A single number still reads as one.
+        ("65 clifton park drive 3201 carrum downs", "65", "number 65"),
+    ],
+)
+def test_role_assignment_keeps_both_halves_of_a_range(raw: str, token: str, role: str) -> None:
+    """Printing only number_first made '14-40' read as "number 14", which looked
+    exactly like the range being lost before the lookup. It was not, but a report
+    that says 14 when the token says 14-40 invites that conclusion."""
+    result = runner.invoke(app, ["parse", raw])
+    assert result.exit_code == 0, result.output
+    assert _roles(result.output)[token] == role
+
+
+@needs_stores
+def test_a_range_that_exists_reaches_address_granularity() -> None:
+    """The exact-range step, end to end. 17-23 WILLS ST is a real G-NAF row."""
+    result = runner.invoke(app, ["parse", "17-23 Wills Street Melbourne VIC 3000"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "number 17-23" in out, "the role must carry both halves"
+    assert "granularity  address" in out
+    assert "17-23 WILLS ST, MELBOURNE VIC 3000" in out
+    assert "number     17-23" in out, "the G-NAF row is the range row"
+    # Nothing fell back, so no range warning.
+    assert "no G-NAF row for the range" not in out
+
+
+@needs_stores
+def test_a_range_whose_first_number_does_not_exist_degrades_to_street() -> None:
+    """'14-40 Wills Street' has no row at NUMBER_FIRST=14 at all, so there is
+    nothing to range-match against and the street centroid is the honest answer.
+    The role still shows 14-40."""
+    result = runner.invoke(app, ["parse", "14-40 Wills Street Melbourne VIC 3000"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert _roles(out)["14-40"] == "number 14-40"
+    assert "granularity  street" in out
+    assert "no G-NAF row for number 14" in out
