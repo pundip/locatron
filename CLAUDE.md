@@ -159,7 +159,19 @@ Single Proxmox LXC. Low container count is a deliberate constraint.
   is no fallback to MySQL, because that is the silent-miss failure the mirror
   exists to prevent.
 
-MySQL is external at `pundip.com:3335`, database `ReferenceDB`.
+MySQL is external at `pundip.com:3335`, database `ReferenceDB`. **Two connection
+pools**, and the split is load-bearing: `mysql.get_read_engine()` sets
+`SET SESSION TRANSACTION READ ONLY` once per new connection and every
+upstream-table query goes through it, while `mysql.get_engine()` serves everything
+else, including the `locatron_unresolved` write.
+
+They are separate because that statement is *session*-scoped. Issued on a borrowed
+connection it stays set after the connection returns to the pool, so any resolve
+that dived into `address_ref` left a connection on which the feedback-log write
+failed with "Cannot execute statement in a READ ONLY transaction". The write is
+best effort, so it was logged and swallowed, and `locatron_unresolved` silently
+stayed empty. Never issue `SET SESSION TRANSACTION READ ONLY` on a pooled
+connection you did not create; use the read pool.
 
 Public URL is `urlloom.com/locatron`, so FastAPI apps use
 `root_path="/locatron"`.

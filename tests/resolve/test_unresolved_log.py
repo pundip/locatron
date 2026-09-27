@@ -8,6 +8,7 @@ take a request down with it.
 from __future__ import annotations
 
 import pytest
+import sqlalchemy as sa
 
 from locatron.resolve import unresolved as log
 from locatron.schemas import Granularity, MatchMethod, ResolveResponse
@@ -15,6 +16,20 @@ from locatron.schemas import Granularity, MatchMethod, ResolveResponse
 #: This module tests `record()` itself, so it opts out of conftest's fake. MySQL
 #: is still made unreachable from inside it, so no row can be written.
 pytestmark = pytest.mark.real_unresolved_log
+
+
+def _db_available() -> bool:
+    try:
+        from locatron.db import mysql
+
+        return bool(mysql.health().get("connected"))
+    except Exception:
+        return False
+
+
+#: The two pool tests read @@transaction_read_only from a live server. They never
+#: write: the read pool could not, and the write pool only runs SELECT 1.
+needs_db_for_pools = pytest.mark.skipif(not _db_available(), reason="ReferenceDB unreachable")
 
 
 def _response(
@@ -168,3 +183,39 @@ def test_the_write_seam_is_the_only_way_to_reach_mysql() -> None:
     body = inspect.getsource(log.record)
     assert "_engine()" in body
     assert "mysql.get_engine" not in body
+
+
+@needs_db_for_pools
+def test_a_gnaf_lookup_does_not_leave_the_pool_unable_to_write() -> None:
+    """The bug this module's warnings were hiding.
+
+    `SET SESSION TRANSACTION READ ONLY` is session-scoped, so issuing it on a
+    borrowed connection left it set when that connection returned to the pool. Any
+    resolve that dived into address_ref poisoned a connection, and the next
+    feedback write to land on it failed with "Cannot execute statement in a READ
+    ONLY transaction" -- logged and swallowed, because the write is best effort, so
+    the table just stayed empty.
+
+    Two pools now: reads are read-only for the life of the connection, writes use
+    a pool that is never touched.
+    """
+    from locatron.db import mysql
+    from locatron.parse.lookup import rows_for_number
+
+    rows_for_number(("CARRUM DOWNS", "CLIFTON PARK", "DR", "65"))
+
+    # The write pool can still open a writable transaction afterwards.
+    with mysql.get_engine().begin() as conn:
+        conn.execute(sa.text("SELECT 1"))
+        assert conn.execute(sa.text("SELECT @@transaction_read_only")).scalar() == 0
+
+
+@needs_db_for_pools
+def test_the_read_pool_cannot_write_at_all() -> None:
+    """Stronger than the statement-scoped version it replaced: read connections are
+    read-only for their whole life, so a read path that starts writing fails
+    immediately and always rather than depending on pool checkout order."""
+    from locatron.db import mysql
+
+    with mysql.get_read_engine().connect() as conn:
+        assert conn.execute(sa.text("SELECT @@transaction_read_only")).scalar() == 1

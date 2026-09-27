@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from locatron.config import get_settings
@@ -55,13 +55,75 @@ def get_engine() -> Engine:
 
 
 @lru_cache
+def get_read_engine() -> Engine:
+    """A second pool whose connections are read-only for their whole life.
+
+    `SET SESSION TRANSACTION READ ONLY` is session-scoped, not statement-scoped, so
+    issuing it inside a borrowed connection leaves it set when that connection goes
+    back to the pool -- and the next borrower cannot write. That silently disabled
+    the `locatron_unresolved` log: any resolve that dived into `address_ref` set the
+    flag, and the next feedback write to land on the same pooled connection failed
+    with "Cannot execute statement in a READ ONLY transaction". The write is best
+    effort, so it was logged and swallowed, and the table simply stayed empty.
+
+    Two pools fixes it at the root rather than by resetting the flag afterwards,
+    which an exception mid-query would skip. This one is read-only by construction,
+    set once per new connection; `get_engine()` is for everything else and its
+    connections are never touched. A read path that starts writing now fails
+    immediately and always, rather than depending on which connection it drew.
+
+    Costs a second pool of `mysql_pool_size`. Worth it: the alternative is a
+    correctness property that holds or not depending on pool checkout order.
+    """
+    s = get_settings()
+    engine = create_engine(
+        s.mysql_url,
+        pool_size=s.mysql_pool_size,
+        max_overflow=s.mysql_pool_max_overflow,
+        pool_recycle=s.mysql_pool_recycle_seconds,
+        pool_pre_ping=True,
+        future=True,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _set_read_only(dbapi_connection: Any, _record: Any) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SET SESSION TRANSACTION READ ONLY")
+        finally:
+            cursor.close()
+
+    return engine
+
+
+@lru_cache
 def get_sessionmaker() -> sessionmaker[Session]:
     return sessionmaker(bind=get_engine(), expire_on_commit=False, future=True)
+
+
+@lru_cache
+def get_read_sessionmaker() -> sessionmaker[Session]:
+    return sessionmaker(bind=get_read_engine(), expire_on_commit=False, future=True)
 
 
 @contextmanager
 def session_scope() -> Iterator[Session]:
     sm = get_sessionmaker()
+    session = sm()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@contextmanager
+def read_session_scope() -> Iterator[Session]:
+    """A session on the read-only pool. Use this for every upstream-table query."""
+    sm = get_read_sessionmaker()
     session = sm()
     try:
         yield session
@@ -118,8 +180,7 @@ def health() -> dict[str, Any]:
 
             out["locality_norm_key_missing"] = s.execute(
                 text(
-                    "SELECT COUNT(*) FROM locatron_locality "
-                    "WHERE norm_key IS NULL OR norm_key = ''"
+                    "SELECT COUNT(*) FROM locatron_locality WHERE norm_key IS NULL OR norm_key = ''"
                 )
             ).scalar()
             out["alias_norm_key_missing"] = s.execute(

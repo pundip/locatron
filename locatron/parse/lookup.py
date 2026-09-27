@@ -181,8 +181,7 @@ def rows_for_number(key: AddressKey) -> tuple[GnafRecord, ...]:
     there than in an ORDER BY.
     """
     locality, street_name, street_type, number_first = key
-    with mysql.session_scope() as s:
-        s.execute(text("SET SESSION TRANSACTION READ ONLY"))
+    with mysql.read_session_scope() as s:
         return tuple(
             _record(r)
             for r in s.execute(
@@ -201,8 +200,7 @@ def row_by_pid(pid: str) -> GnafRecord | None:
     """One row by ADDRESS_DETAIL_PID, for following an alias to its principal."""
     if not pid:
         return None
-    with mysql.session_scope() as s:
-        s.execute(text("SET SESSION TRANSACTION READ ONLY"))
+    with mysql.read_session_scope() as s:
         row = s.execute(text(_BY_PID_SQL), {"pid": pid}).mappings().first()
         return _record(row) if row else None
 
