@@ -52,8 +52,8 @@ NON_AU_INPUTS = tuple(r["input"] for r in ROWS if r["expected_country"] != "AUS"
 
 def test_golden_set_shape_is_unchanged() -> None:
     """Guards the tables below against drift in golden.csv."""
-    assert len(ROWS) == 32, f"golden.csv now has {len(ROWS)} rows"
-    assert len(AU_INPUTS) == 22
+    assert len(ROWS) == 34, f"golden.csv now has {len(ROWS)} rows"
+    assert len(AU_INPUTS) == 24
     assert len(NON_AU_INPUTS) == 10
 
 
@@ -77,6 +77,9 @@ EXPECTED_POSTCODES: dict[str, list[str]] = {
     "3201": ["3201"],
     "PO Box 45 World Square NSW 2002": ["2002"],
     "Ryde NSW 2112": ["2112"],
+    # Metro-area rows: a stated state and no postcode, so nothing to extract.
+    "Melbourne, Victoria, Australia": [],
+    "Perth, Western Australia": [],
     "Hamilton Crescent Ryde NSW 2112": ["2112"],
     "St Kilda East VIC": [],
     "Ku-ring-gai NSW": [],

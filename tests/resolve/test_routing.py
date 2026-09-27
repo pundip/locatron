@@ -99,22 +99,28 @@ def test_new_york_does_not_become_a_street_in_york_wa() -> None:
 
 
 @needs_stores
-def test_victoria_australia_is_rejected_for_being_fuzzy_and_incomplete() -> None:
-    """It does fire the state trigger. The gate is what saves it, and the reason
-    matters: a fuzzy locality that leaves a token unexplained is a state name
-    being read as a suburb."""
-    p = au_path.parse("Victoria Australia")
-    assert "state" in au_path.triggers(p)
+def test_a_fuzzy_locality_with_a_token_to_spare_is_rejected() -> None:
+    """The gate's first fuzzy rule, reached through the PO box trigger.
+
+    'PO Box 45 Sao Paulo' fuzzy-matches locality PAULS POCKET and still has SAO
+    over, which is a foreign city being read as an Australian suburb. A bare 'Sao
+    Paulo' never reaches the gate -- it has no address signal -- but the rule still
+    has work wherever a trigger does fire.
+    """
+    p = au_path.parse("PO Box 45 Sao Paulo")
+    assert au_path.triggers(p) == ("pobox",)
+    assert p.top is not None and p.top.locality.candidate.match == "fuzzy"
+    assert p.top.unexplained
     take, why = au_path.takes_au_path(p)
     assert take is False
-    assert "fuzzy" in why and "unexplained" in why
+    assert why == "fuzzy locality with unexplained tokens"
 
 
 @needs_stores
-def test_a_state_token_alone_has_nothing_to_resolve() -> None:
+def test_a_state_token_alone_is_not_an_address() -> None:
     p = au_path.parse("VIC")
-    assert "state" in au_path.triggers(p)
-    assert au_path.takes_au_path(p) == (False, "no locality hypothesis")
+    assert any(t.strong for t in p.states)
+    assert au_path.takes_au_path(p) == (False, "no AU signal")
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +133,10 @@ def test_a_state_token_alone_has_nothing_to_resolve() -> None:
     ("raw", "trigger"),
     [
         ("65 Clifton Park Dr Carrum Downs VIC 3201", "postcode"),
-        ("Carrum Downs VIC", "state"),
         ("PO Box 45 World Square NSW 2002", "pobox"),
-        # No postcode, no state and no number: the word DRIVE is the whole signal.
+        # No postcode and no number: the word DRIVE is the whole signal.
         ("Clifton Park Drive Carrum Downs", "street+type"),
+        ("12 Clifton Street 3201", "number+street"),
     ],
 )
 def test_each_trigger_routes_to_the_au_path(raw: str, trigger: str) -> None:
@@ -140,14 +146,38 @@ def test_each_trigger_routes_to_the_au_path(raw: str, trigger: str) -> None:
 
 
 @needs_stores
-def test_a_fuzzy_locality_that_explains_everything_is_allowed() -> None:
-    """'Ku-ring-gai NSW' fuzzy-matches KU-RING-GAI CHASE and leaves nothing over,
-    which is the other side of the Victoria Australia rule."""
-    p = au_path.parse("Ku-ring-gai NSW")
-    assert p.top is not None and p.top.locality.candidate.match == "fuzzy"
-    assert not p.top.unexplained
-    assert au_path.takes_au_path(p)[0] is True
-    assert _resolve("Ku-ring-gai NSW").granularity is Granularity.LOCALITY
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "Carrum Downs VIC",
+        "St Kilda East VIC",
+        "Richmond VIC",
+        "Melbourne, Victoria, Australia",
+        "Perth, Western Australia",
+    ],
+)
+def test_a_stated_state_is_not_an_address_signal(raw: str) -> None:
+    """A state says where in the world the input is, not that it describes a
+    street. 'Perth, Western Australia' names a metro area, and answering it with
+    the PERTH 6000 locality is a more precise answer to a question nobody asked.
+
+    These still resolve -- the world path handles a place name with a state in it
+    perfectly well -- they just do not come here.
+    """
+    p = au_path.parse(raw)
+    assert any(t.strong for t in p.states), "premise: the state really is stated"
+    assert au_path.triggers(p) == ()
+    assert au_path.takes_au_path(p) == (False, "no AU signal")
+
+
+@needs_stores
+def test_a_state_name_input_still_resolves_through_the_world_path() -> None:
+    """Removing the state trigger must not lose these answers, only move them.
+    'Ku-ring-gai NSW' still comes back as a locality; the world gazetteer does its
+    own fuzzy matching."""
+    r = _resolve("Ku-ring-gai NSW")
+    assert r.granularity is Granularity.LOCALITY
+    assert r.admin1 is not None and r.admin1.code == "NSW"
 
 
 @needs_stores
@@ -282,52 +312,65 @@ def test_a_broken_au_path_falls_through_to_the_world_path(monkeypatch) -> None:
 
 @needs_stores
 @pytest.mark.parametrize(
-    ("raw", "reaches"),
+    "raw",
     [
         # Every full state name fuzzy-matches some unrelated locality, and each
         # leaves nothing unexplained, because the state token accounted for the
         # tokens. Only the span test separates them.
-        ("New South Wales", "SOUTH BOWENFELS"),
-        ("Western Australia", "AUSTRALIND"),
-        ("South Australia", "SOUTHEND"),
-        ("Tasmania", "MATHINNA"),
+        #
+        # A PO box is what puts them in front of the gate at all: it is a trigger,
+        # so these reach routing with a fuzzy locality winning, where a bare state
+        # name now stops at "no AU signal".
+        "PO Box 45 New South Wales",
+        "PO Box 45 Western Australia",
+        "PO Box 45 Tasmania",
+        "GPO Box 9 New South Wales",
     ],
 )
-def test_a_state_name_is_not_a_suburb(raw: str, reaches: str) -> None:
+def test_a_state_name_is_not_a_suburb(raw: str) -> None:
+    """Which suburb it reaches is deliberately not asserted. 'PO Box 45 New South
+    Wales' lands on SOUTH BOWENFELS or SOUTH NOWRA depending on the order MySQL
+    returned the gazetteer rows in, because they tie on similarity. The property
+    that matters is that a fuzzy locality explaining nothing the state token did
+    not is refused, whichever one it is.
+    """
     p = au_path.parse(raw)
     assert p.top is not None
-    assert p.top.locality.candidate.locality == reaches, "premise: it really does match that"
+    assert au_path.triggers(p) == ("pobox",), "premise: it did reach the gate"
+    assert p.top.locality.candidate.match == "fuzzy", "premise: only fuzzy got there"
     assert not p.top.unexplained, "premise: the state token explained the tokens"
     take, why = au_path.takes_au_path(p)
-    assert take is False, f"{raw} must not resolve to {reaches}"
+    assert take is False, f"{raw} must not resolve to {p.top.locality.candidate.locality}"
     assert why == "fuzzy locality inside the state token"
 
 
 @needs_stores
 def test_a_country_name_is_not_a_suburb() -> None:
-    """'New South Wales Australia' fuzzy-matches locality AUSTRAL on the token
-    AUSTRALIA, which sits outside the state token's span and so passes the span
-    test. The country check is what stops it."""
-    p = au_path.parse("New South Wales Australia")
+    """'PO Box 45 Australia' fuzzy-matches locality AUSTRALIA FAIR on the token
+    AUSTRALIA, which sits outside any state token and so passes the span test. The
+    country check is what stops it."""
+    p = au_path.parse("PO Box 45 Australia")
     assert p.top is not None
-    assert p.top.locality.candidate.locality == "AUSTRAL"
+    assert p.top.locality.candidate.match == "fuzzy"
     take, why = au_path.takes_au_path(p)
     assert take is False
     assert why == "fuzzy locality is a country name"
-    assert _resolve("New South Wales Australia").admin1.code == "NSW"
 
 
-@needs_stores
-def test_a_fuzzy_locality_reaching_past_the_state_token_is_still_allowed() -> None:
-    """The other side of the span test, and the reason it is `within` rather than
-    `overlaps`: KU-RING-GAI CHASE is matched over a span that includes the state
-    token, but it also covers a token the state token does not."""
-    p = au_path.parse("Ku-ring-gai NSW")
-    h = p.top.locality
-    assert h.state_span is not None
-    assert h.locality_span.overlaps(h.state_span), "it does overlap"
-    assert not h.locality_span.within(h.state_span), "but it reaches beyond"
-    assert au_path.takes_au_path(p)[0] is True
+def test_within_is_not_overlaps() -> None:
+    """The distinction the span test rests on, at the Span level so it holds
+    whatever routing does with it. 'Ku-ring-gai NSW' matches its locality over a
+    span that includes the state token yet reaches a token beyond it; a state name
+    read as a suburb does not."""
+    from locatron.parse.tokens import Span
+
+    reaches_beyond, state = Span(0, 2), Span(1, 2)
+    assert reaches_beyond.overlaps(state)
+    assert not reaches_beyond.within(state)
+
+    inside = Span(1, 3)
+    assert inside.within(Span(0, 3))
+    assert Span(2, 2).within(Span(2, 2)), "an empty span is within itself"
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +387,7 @@ def test_a_world_input_does_not_pay_for_the_australian_stages(raw: str) -> None:
     for an input like this, so neither runs.
     """
     p = au_path.parse(raw)
-    assert au_path.cheap_triggers(p.components, p.states) is False
+    assert au_path.cheap_triggers(p.components) is False
     assert au_path.could_match_a_street(p.ts, p.components) is False
     # No street fetch: every hypothesis came back without one.
     assert all(h.street is None for h in p.hypotheses)
@@ -367,9 +410,9 @@ def test_an_input_that_could_name_a_street_still_gets_the_street_stage(raw: str,
 
 
 @needs_stores
-def test_the_fuzzy_sweep_runs_when_the_input_says_it_is_australian() -> None:
-    """The other side of the skip: 'Ku-ring-gai NSW' needs the fuzzy pass to reach
-    KU-RING-GAI CHASE, and its state token is what earns it."""
-    p = au_path.parse("Ku-ring-gai NSW")
-    assert au_path.cheap_triggers(p.components, p.states) is True
-    assert p.top is not None and p.top.locality.candidate.match == "fuzzy"
+@pytest.mark.parametrize("raw", ["PO Box 45 New South Wales", "Perth 7300"])
+def test_the_fuzzy_sweep_runs_when_the_input_looks_like_an_address(raw: str) -> None:
+    """The other side of the skip. A postcode or a PO box earns the sweep; without
+    one, a fuzzy locality could not route here anyway."""
+    p = au_path.parse(raw)
+    assert au_path.cheap_triggers(p.components) is True

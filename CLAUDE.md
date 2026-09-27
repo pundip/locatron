@@ -177,10 +177,17 @@ Triggers — each is something a loose world place string does not carry:
 | Trigger | Fires on |
 |---|---|
 | `postcode` | a postcode candidate that validates against `locatron_locality` |
-| `state` | a **strong** state token, i.e. `aus_state_bucket`'s `state_tokens`, never a `state_hint` |
-| `pobox` | a PO box was found |
+| `pobox` | a literal `PO BOX`/`GPO BOX` run — the postal analogue of a street number, and the one address form G-NAF omits |
 | `street+type` | a street match whose `reading` is `name+type`, so the input supplied a street-type word |
 | `number+street` | a street number and any street match |
+
+The bar is an **address** signal, not an Australian one. A stated state is
+deliberately **not** a trigger: it says where in the world the input is, not that
+it describes a street. `Melbourne, Victoria, Australia` and `Perth, Western
+Australia` name metro areas, and answering them with the MELBOURNE 3000 or PERTH
+6000 locality is a more precise answer to a question nobody asked. A state token
+still scores, and still disambiguates once something else has earned the path —
+`Richmond VIC` reaching the Victorian Richmond depends on it.
 
 The two street triggers are narrow on purpose. A bare street match is **not** a
 trigger: `New York` matches street `NEW ST` in locality `YORK` at score 2.555
@@ -191,16 +198,25 @@ number in front of it.
 
 Gate — all must hold:
 
-- a locality hypothesis exists at all. `VIC` alone fires the `state` trigger and
-  produces no hypothesis, so it stays on the world path and keeps `admin1`.
+- a locality hypothesis exists at all.
 - the winning joint score is not negative. A floor, not a tuning knob: a
   negative score means the parse explains less than it fails to.
-- if the winning locality matched **fuzzy**, nothing is left unexplained.
-  `Victoria Australia` fires `state`, then fuzzy-matches locality `TORRITA` and
-  leaves `AUSTRALIA` unexplained — a state name being read as a suburb. It keeps
-  `admin1`. `Ku-ring-gai NSW` is also fuzzy, explains every token, and takes the
-  AU path. This replaces a score threshold, which would have needed a magic
-  number between 0.893 and 1.627 and nothing to justify it.
+- if the winning locality matched **fuzzy**, it must be evidence of its own.
+  Two ways it can fail to be, both reached in practice through the `pobox`
+  trigger:
+  - it leaves input unexplained. `PO Box 45 Sao Paulo` fuzzy-matches
+    `PAULS POCKET` with `SAO` spare.
+  - its span sits **within** the state token's, so it explains nothing the state
+    token did not. Every full state name does this: `PO Box 45 New South Wales`
+    reaches `SOUTH BOWENFELS`, `PO Box 45 Western Australia` reaches
+    `AUSTRALIND`. `Span.within()` is deliberately not `overlaps()` — a locality
+    may legitimately overlap its state token as long as it reaches a token
+    beyond it.
+  - a fuzzy locality that is a **country** name is rejected too:
+    `PO Box 45 Australia` reaches `AUSTRALIA FAIR`.
+
+  This replaces a score threshold, which would have needed a magic number and
+  nothing to justify it.
 
 `scripts/route_probe.py` prints the route and landing granularity for every
 golden row and probe case. Run it after touching the triggers, the gate or the

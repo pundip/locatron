@@ -174,13 +174,14 @@ def _no_streets(_keys: Any) -> dict[Any, tuple[Any, ...]]:
     return {}
 
 
-def cheap_triggers(components: Components, states: tuple[StateToken, ...]) -> bool:
+def cheap_triggers(components: Components) -> bool:
     """Whether a trigger has fired that needs no street matching to see.
 
-    A postcode, a stated state and a PO box are all pure token work, so they are
-    known before the gazetteer is touched.
+    A postcode and a PO box are both pure token work, so they are known before the
+    gazetteer is touched. The two street triggers are not, which is what the
+    street stage is for.
     """
-    return bool(components.postcodes) or bool(components.boxes) or any(s.strong for s in states)
+    return bool(components.postcodes) or bool(components.boxes)
 
 
 def could_match_a_street(ts: TokenStream, components: Components) -> bool:
@@ -213,20 +214,20 @@ def parse(text: str, au: AuGazetteer | None = None, **street_kwargs: Any) -> AuP
     ts = tokenize(text)
     components = extract_components(ts, known_postcodes())
     states = find_state_tokens(ts, gaz)
-    cheap = cheap_triggers(components, states)
+    cheap = cheap_triggers(components)
 
     # The fuzzy locality sweep runs rapidfuzz over ~16k keys per n-gram, and it
     # only runs when nothing matched exactly -- which is exactly what a
     # non-Australian input looks like. 'Las Vegas' spent 51 ms failing to be an
     # Australian suburb, on the path CLAUDE.md's first use case is built around.
     #
-    # It is skipped unless a postcode, a stated state or a PO box says the input
-    # is Australian, because without one of those a fuzzy locality cannot route
-    # here on its own: the only remaining triggers are the street ones, and a
-    # street needs a locality whose streets we can fetch, which an exact or alias
-    # hit already provides. The cost is that a misspelled suburb carrying neither
-    # a postcode nor a state nor a number now answers from the world gazetteer
-    # instead, which does its own fuzzy matching.
+    # It is skipped unless a postcode or a PO box says the input is an address,
+    # because without one of those a fuzzy locality cannot route here on its own:
+    # the only remaining triggers are the street ones, and a street needs a
+    # locality whose streets we can fetch, which an exact or alias hit already
+    # provides. The cost is that a misspelled suburb carrying no postcode and no
+    # number now answers from the world gazetteer instead, which does its own
+    # fuzzy matching.
     hyps = generate_hypotheses(
         ts,
         gaz,
@@ -257,20 +258,35 @@ def parse(text: str, au: AuGazetteer | None = None, **street_kwargs: Any) -> AuP
 
 
 def triggers(p: AuParse) -> tuple[str, ...]:
-    """Signals that this is an Australian address rather than a place name.
+    """Signals that the input is an Australian *address* rather than a place name.
 
-    The street triggers are narrow on purpose. A bare street match is not enough:
-    'New York' matches street NEW ST in locality YORK at score 2.555 with nothing
-    left unexplained, and routing that here would answer a New York query with a
-    street in York, WA. What distinguishes a real Australian street is either an
-    explicit type word in the input ('Clifton Park DRIVE') or a number in front
-    of it.
+    The bar is deliberately an address signal and not an Australian one. A stated
+    state says where in the world the input is, not that it describes a street:
+    'Melbourne, Victoria, Australia' and 'Perth, Western Australia' name metro
+    areas, and answering them with the MELBOURNE 3000 or PERTH 6000 locality is a
+    more precise answer to a question nobody asked. So a state token is not a
+    trigger. It still scores, and it still disambiguates once something else has
+    earned the path -- 'Richmond VIC' reaching the Victorian Richmond depends on
+    it -- but on its own it leaves the input on the world path.
+
+    That leaves four, each of which is structurally part of an address:
+
+        postcode        a postcode candidate that validates
+        pobox           a literal 'PO BOX'/'GPO BOX' run, the postal analogue of
+                        a street number, and the one address form G-NAF omits
+        street+type     a street match where the input supplied a type word
+        number+street   a street match with a number in front of it
+
+    The street triggers are narrow for their own reason. A bare street match is
+    not enough: 'New York' matches street NEW ST in locality YORK at score 2.555
+    with nothing left unexplained, and routing that here would answer a New York
+    query with a street in York, WA. What distinguishes a real Australian street
+    is an explicit type word in the input ('Clifton Park DRIVE') or a number in
+    front of it.
     """
     out: list[str] = []
     if p.components.postcodes:
         out.append("postcode")
-    if any(s.strong for s in p.states):
-        out.append("state")
     if p.components.boxes:
         out.append("pobox")
     top = p.top
