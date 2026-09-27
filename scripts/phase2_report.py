@@ -97,6 +97,10 @@ LIVE_CASES = [
     "Delhi",
     "Carrum Downs VIC",
     "3201",
+    # The AU address path end to end, which the world-place cases above never
+    # touch: a full G-NAF record, and a unit reached through the spelled form.
+    "65 Clifton Park Dr Carrum Downs VIC 3201",
+    "Unit 5 1 Smith Street Fitzroy 3065",
 ]
 
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) locatron-report/1"
@@ -418,7 +422,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default="https://urlloom.com/locatron", help="API base for --live")
     parser.add_argument("--header", action="append", default=[], help='extra header for --live, "Name: value" (repeatable)')
     parser.add_argument("--ua", default=DEFAULT_UA, help="User-Agent for --live")
-    parser.add_argument("--golden-baseline", type=int, default=23, help="golden passes expected (default 23)")
+    parser.add_argument(
+        "--golden-baseline",
+        type=int,
+        default=35,
+        help="golden passes expected (default 35, the full set)",
+    )
     parser.add_argument("--cases", type=Path, help="file of parser inputs, one per line, replacing the built-in list")
     parser.add_argument("--parse-lines", type=int, default=600, help="max lines of parser output kept (default 600)")
     parser.add_argument("--skip-tests", action="store_true", help="skip pytest (faster reruns)")
