@@ -27,9 +27,20 @@ def _db_available() -> bool:
         return False
 
 
-#: The two pool tests read @@transaction_read_only from a live server. They never
-#: write: the read pool could not, and the write pool only runs SELECT 1.
+#: The pool tests read @@transaction_read_only from a live server, and probe the
+#: write pool with an UPDATE that matches no rows. None of them writes data.
 needs_db_for_pools = pytest.mark.skipif(not _db_available(), reason="ReferenceDB unreachable")
+
+#: Proves a connection can write without changing anything. MySQL refuses it with
+#: error 1792 inside a read-only transaction, and `WHERE 1 = 0` means it can never
+#: touch a row -- which matters, because inserting one is exactly what conftest
+#: forbids and what put nine synthetic rows in the real table.
+#:
+#: The alternative instruments do not work here. A fake cannot detect this bug at
+#: all: the failure happens at the server, not in Python. And a disposable table is
+#: impossible -- the service account is granted SELECT plus INSERT/UPDATE on two
+#: tables, so CREATE TABLE and even CREATE TEMPORARY TABLE are denied.
+_NO_OP_WRITE = sa.text("UPDATE locatron_unresolved SET hit_count = hit_count WHERE 1 = 0")
 
 
 def _response(
@@ -219,3 +230,75 @@ def test_the_read_pool_cannot_write_at_all() -> None:
 
     with mysql.get_read_engine().connect() as conn:
         assert conn.execute(sa.text("SELECT @@transaction_read_only")).scalar() == 1
+
+
+@needs_db_for_pools
+def test_repeated_lookups_never_leave_the_write_pool_unable_to_write() -> None:
+    """Regression for the bug fixed in c25558c, interleaved and repeated.
+
+    `SET SESSION TRANSACTION READ ONLY` is session-scoped. Issued on a connection
+    borrowed from the shared pool, it stayed set when that connection went back, so
+    a resolve that dived into address_ref left a connection the feedback write could
+    not use. The write is best effort -- logged and swallowed -- so the only symptom
+    was locatron_unresolved staying empty, and which resolve broke which write
+    depended on pool checkout order, so it looked intermittent.
+
+    This reproduces the real sequence rather than the mechanism: an AU address
+    resolve that hits address_ref, then the write, over and over, more times than
+    the pool holds connections. Several connections are opened first so the pool
+    really has more than one, and the write pool is checked on every pass.
+
+    Both of those are load-bearing, not caution. Run against the pre-fix code this
+    fails on **pass 3**, not pass 0: the first three passes drew connections that
+    happened to be clean. A single lookup followed by a single check -- the obvious
+    way to write this test -- would have passed on the broken code and proved
+    nothing.
+
+    Asserted with a no-op UPDATE, for the reasons on _NO_OP_WRITE.
+    """
+    from locatron.config import get_settings
+    from locatron.db import mysql
+    from locatron.resolve.pipeline import resolve_one
+
+    pool_size = get_settings().mysql_pool_size
+
+    # Force distinct connections into the write pool, so this does not pass by
+    # happening to reuse one connection that was never poisoned.
+    held = [mysql.get_engine().connect() for _ in range(pool_size)]
+    for conn in held:
+        conn.close()
+
+    for i in range(3 * pool_size):
+        answer = resolve_one("65 Clifton Park Dr Carrum Downs VIC 3201", record_unresolved=False)
+        assert answer.granularity is Granularity.ADDRESS, (
+            f"pass {i}: premise failed, the resolve did not reach address_ref"
+        )
+
+        with mysql.get_engine().begin() as conn:
+            read_only = conn.execute(sa.text("SELECT @@transaction_read_only")).scalar()
+            assert read_only == 0, (
+                f"pass {i}: drew a read-only connection from the write pool, so the "
+                f"feedback log could not have written"
+            )
+            # The write the resolver would really have attempted.
+            assert conn.execute(_NO_OP_WRITE).rowcount == 0
+
+
+@needs_db_for_pools
+def test_the_read_pool_stays_read_only_across_checkouts() -> None:
+    """The other half: read connections are read-only for their whole life, not for
+    one statement. A read path that starts writing has to fail every time rather
+    than depending on which connection it drew."""
+    from locatron.config import get_settings
+    from locatron.db import mysql
+    from locatron.parse.lookup import rows_for_number
+
+    for _ in range(2 * get_settings().mysql_pool_size):
+        rows_for_number(("CARRUM DOWNS", "CLIFTON PARK", "DR", "65"))
+        with mysql.get_read_engine().connect() as conn:
+            assert conn.execute(sa.text("SELECT @@transaction_read_only")).scalar() == 1
+        with (
+            pytest.raises(sa.exc.OperationalError, match="READ ONLY"),
+            mysql.get_read_engine().begin() as conn,
+        ):
+            conn.execute(_NO_OP_WRITE)
