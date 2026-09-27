@@ -359,3 +359,193 @@ def follow_alias(
         f"input used the alias street {alias_name!r}; returned the principal "
         f"record {principal_name!r} ({target.address_detail_pid})",
     )
+
+
+# ---------------------------------------------------------------------------
+# the fallback ladder
+# ---------------------------------------------------------------------------
+
+
+class Granularity:
+    """How far down the ladder a lookup got. Lower is more precise."""
+
+    UNIT = "unit"
+    ADDRESS = "address"
+    STREET = "street"
+    LOCALITY = "locality"
+    POSTAL = "postal"
+
+
+#: Ceiling on confidence when the matched street's type is not the one the input
+#: asked for. A substituted type means we answered a question slightly different
+#: from the one asked -- 'Clifton Street' resolved to CLIFTON GR -- and a
+#: unit or address returned at full confidence would invite a downstream consumer
+#: to treat it as exact. Named rather than inline so it can be tuned with the
+#: other weights, and applied as a cap rather than a subtraction so it cannot
+#: push a weak match below the floor.
+SUBSTITUTED_TYPE_CONFIDENCE_CAP = 0.70
+
+
+@dataclass(frozen=True, slots=True)
+class LookupResult:
+    """What a lookup concluded, and how it got there."""
+
+    granularity: str
+    lat: float | None
+    lng: float | None
+    record: GnafRecord | None
+    """The full G-NAF row, for unit and address granularity. None below that:
+    street and locality answers come from precomputed centroids, and postal never
+    touches address_ref at all."""
+    warnings: tuple[str, ...]
+    hypothesis: object
+    """The StreetHypothesis this came from, carried so a caller can explain the
+    answer without re-running the parse."""
+    confidence_cap: float | None = None
+    """Set when something about the match should stop a caller reporting full
+    confidence. None means nothing capped it."""
+    round_trips: int = 0
+    round_trip_labels: tuple[str, ...] = ()
+
+    @property
+    def is_address_level(self) -> bool:
+        return self.granularity in (Granularity.UNIT, Granularity.ADDRESS)
+
+
+def lookup(
+    hypothesis,
+    *,
+    number_first: str | None = None,
+    number_last: str | None = None,
+    unit: str | None = None,
+    po_box: bool = False,
+    street_centroid: tuple[float | None, float | None] | None = None,
+    source: AddressSource = rows_for_number,
+    principal: PrincipalSource = row_by_pid,
+) -> LookupResult:
+    """Walk the ladder for one winning hypothesis.
+
+        postal    a PO box, or a locality flagged is_postal_only. G-NAF holds no
+                  PO boxes at all, so address_ref is never queried.
+        locality  no street matched. Locality centroid.
+        street    a street matched but no number was given, or no row exists for
+                  the number. Street centroid from the mirror.
+        address   a row at that number.
+        unit      a row at that number whose FLAT_NUMBER matches.
+
+    At most two MySQL round trips: one dive on ix_ar_loc_st_num, and one more only
+    when an alias has to be followed. `round_trips` reports the actual count.
+    """
+    trips = RoundTrips()
+    warnings: list[str] = []
+    candidate = hypothesis.locality.candidate
+
+    # --- postal: never touches address_ref -------------------------------
+    if po_box or candidate.is_postal_only:
+        if po_box:
+            warnings.append("PO box: G-NAF holds no postal addresses, so no street match")
+        return _result(
+            Granularity.POSTAL,
+            candidate.row.lat,
+            candidate.row.lng,
+            None,
+            warnings,
+            hypothesis,
+            trips,
+        )
+
+    street = hypothesis.street
+    if street is None:
+        return _result(
+            Granularity.LOCALITY,
+            candidate.row.lat,
+            candidate.row.lng,
+            None,
+            warnings,
+            hypothesis,
+            trips,
+        )
+
+    # A substituted type caps confidence wherever the ladder lands, and says so.
+    cap: float | None = None
+    sub = hypothesis.street_type_substituted
+    if sub is not None:
+        cap = SUBSTITUTED_TYPE_CONFIDENCE_CAP
+        warnings.append(
+            f"street type substituted: input said {sub.written_as!r} "
+            f"({sub.input_type or 'unknown'}), matched {sub.matched_type or 'none'}"
+        )
+
+    s_lat, s_lng = street_centroid if street_centroid else (street.row.lat, street.row.lng)
+
+    if not number_first:
+        return _result(Granularity.STREET, s_lat, s_lng, None, warnings, hypothesis, trips, cap)
+
+    # --- address and unit ------------------------------------------------
+    key: AddressKey = (
+        street.row.locality,
+        street.row.street_name,
+        street.row.street_type,
+        number_first,
+    )
+    rows = counted(source, trips, f"rows_for_number {key}")(key)
+
+    if not rows:
+        warnings.append(
+            f"no G-NAF row for number {number_first} on "
+            f"{street.street_key} in {street.row.locality}; fell back to the street"
+        )
+        return _result(Granularity.STREET, s_lat, s_lng, None, warnings, hypothesis, trips, cap)
+
+    if unit:
+        hit = match_unit(rows, unit)
+        if hit is not None:
+            hit, alias_warnings = follow_alias(
+                hit, counted_principal(principal, trips, "row_by_pid")
+            )
+            warnings.extend(alias_warnings)
+            return _result(
+                Granularity.UNIT, hit.lat, hit.lng, hit, warnings, hypothesis, trips, cap
+            )
+        # The building exists, the flat does not. Return the building rather than
+        # nothing, and say which part failed.
+        warnings.append(
+            f"unit {unit} not found at {number_first} {street.street_key}; returned the building"
+        )
+
+    chosen, exact = match_range(rows, number_last)
+    if number_last and not exact:
+        warnings.append(
+            f"no G-NAF row for the range {number_first}-{number_last}; matched {number_first} alone"
+        )
+    if chosen is None:
+        return _result(Granularity.STREET, s_lat, s_lng, None, warnings, hypothesis, trips, cap)
+
+    chosen, alias_warnings = follow_alias(chosen, counted_principal(principal, trips, "row_by_pid"))
+    warnings.extend(alias_warnings)
+    return _result(
+        Granularity.ADDRESS, chosen.lat, chosen.lng, chosen, warnings, hypothesis, trips, cap
+    )
+
+
+def _result(
+    granularity: str,
+    lat: float | None,
+    lng: float | None,
+    record: GnafRecord | None,
+    warnings: Sequence[str],
+    hypothesis,
+    trips: RoundTrips,
+    cap: float | None = None,
+) -> LookupResult:
+    return LookupResult(
+        granularity=granularity,
+        lat=lat,
+        lng=lng,
+        record=record,
+        warnings=tuple(warnings),
+        hypothesis=hypothesis,
+        confidence_cap=cap,
+        round_trips=trips.count,
+        round_trip_labels=tuple(trips.labels),
+    )
