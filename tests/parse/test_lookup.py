@@ -18,6 +18,7 @@ from locatron.db import mysql
 from locatron.gazetteer.au import LocalityRow
 from locatron.parse.locality import Candidate, Hypothesis
 from locatron.parse.lookup import (
+    RANGE_MISMATCH_CONFIDENCE_CAP,
     SUBSTITUTED_TYPE_CONFIDENCE_CAP,
     AddressKey,
     GnafRecord,
@@ -564,6 +565,79 @@ def test_no_substitution_means_no_cap() -> None:
 
 def test_the_cap_is_a_ceiling_below_one() -> None:
     assert 0.0 < SUBSTITUTED_TYPE_CONFIDENCE_CAP < 1.0
+    assert 0.0 < RANGE_MISMATCH_CONFIDENCE_CAP < 1.0
+
+
+def _wills(**kw):
+    """A lookup against 17-23 WILLS ST, the only stored row at NUMBER_FIRST 17."""
+    return _lookup(
+        _hyp(locality="MELBOURNE", state="VIC", postcode="3000", street_name="WILLS"),
+        number_first="17",
+        **kw,
+    )
+
+
+def test_a_range_that_does_not_match_the_stored_one_caps_confidence() -> None:
+    """'17-99' asked about 17 through 99 and got a row that runs 17 to 23. The
+    first number is exact, the extent is not the one asked for."""
+    r = _wills(number_last="99")
+    assert r.granularity == Granularity.ADDRESS
+    assert r.record is not None and r.record.number_last == "23"
+    assert r.confidence_cap == RANGE_MISMATCH_CONFIDENCE_CAP
+
+
+def test_the_range_warning_names_the_range_asked_for_and_the_one_stored() -> None:
+    warning = next(w for w in _wills(number_last="99").warnings if "range" in w)
+    assert "17-99" in warning, "the range the input asked for"
+    assert "17-23" in warning, "the range actually stored"
+
+
+def test_the_exact_range_is_not_a_mismatch() -> None:
+    r = _wills(number_last="23")
+    assert r.record is not None and r.record.number_last == "23"
+    assert r.confidence_cap is None
+    assert not any("range" in w for w in r.warnings)
+
+
+def test_a_bare_number_matching_a_stored_range_is_not_a_mismatch() -> None:
+    """'17 Wills Street' asks nothing about extent, so landing on the stored
+    17-23 answers the question that was asked. Capping this would penalise every
+    single-number input that happens to sit at the head of a range."""
+    r = _wills()
+    assert r.record is not None and r.record.number_last == "23"
+    assert r.confidence_cap is None
+    assert not any("range" in w for w in r.warnings)
+
+
+def test_a_range_against_a_row_with_no_stored_range_still_mismatches() -> None:
+    """1 SMITH ST carries no NUMBER_LAST at all, so '1-5' did not get its extent
+    either. The warning has no stored range to name."""
+    r = _lookup(_hyp(), number_first="1", number_last="5")
+    assert r.granularity == Granularity.ADDRESS
+    assert r.confidence_cap == RANGE_MISMATCH_CONFIDENCE_CAP
+    warning = next(w for w in r.warnings if "range" in w)
+    assert "1-5" in warning
+    assert "whose stored range is" not in warning
+
+
+def test_two_doubts_take_the_tighter_cap() -> None:
+    """A substituted type and a range mismatch at once must not let the looser
+    range cap raise the ceiling the substitution set."""
+    r = _lookup(
+        _hyp(
+            locality="MELBOURNE",
+            state="VIC",
+            postcode="3000",
+            street_name="WILLS",
+            substituted=_substituted(),
+        ),
+        number_first="17",
+        number_last="99",
+    )
+    assert RANGE_MISMATCH_CONFIDENCE_CAP > SUBSTITUTED_TYPE_CONFIDENCE_CAP, "premise"
+    assert r.confidence_cap == SUBSTITUTED_TYPE_CONFIDENCE_CAP
+    assert any("substituted" in w for w in r.warnings)
+    assert any("range" in w for w in r.warnings)
 
 
 # ---------------------------------------------------------------------------

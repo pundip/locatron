@@ -397,6 +397,22 @@ class Granularity:
 #: push a weak match below the floor.
 SUBSTITUTED_TYPE_CONFIDENCE_CAP = 0.70
 
+#: Ceiling on confidence when the input gave a number range and no stored row
+#: carries it, so the ladder fell back to NUMBER_FIRST alone. '17-99 Wills St'
+#: lands on the stored 17-23: the street and the first number are confirmed
+#: exact, but the extent is not the one asked for, and 17-99 may well span
+#: several G-NAF rows. Looser than the substituted-type cap because the doubt is
+#: narrower -- there the matched street was a different street.
+#:
+#: Only a *given* range can mismatch. A bare '17' matching a stored 17-23 asks
+#: nothing about extent, so nothing caps it.
+RANGE_MISMATCH_CONFIDENCE_CAP = 0.75
+
+
+def _tighter(current: float | None, cap: float) -> float:
+    """The lower of two ceilings, so a second doubt can only narrow the first."""
+    return cap if current is None else min(current, cap)
+
 
 @dataclass(frozen=True, slots=True)
 class LookupResult:
@@ -489,7 +505,7 @@ def lookup(
     cap: float | None = None
     sub = hypothesis.street_type_substituted
     if sub is not None:
-        cap = SUBSTITUTED_TYPE_CONFIDENCE_CAP
+        cap = _tighter(cap, SUBSTITUTED_TYPE_CONFIDENCE_CAP)
         warnings.append(
             f"street type substituted: input said {sub.written_as!r} "
             f"({sub.input_type or 'unknown'}), matched {sub.matched_type or 'none'}"
@@ -542,9 +558,19 @@ def lookup(
 
     chosen, exact = match_range(rows, number_last)
     if number_last and not exact:
-        warnings.append(
-            f"no G-NAF row for the range {number_first}-{number_last}; matched {number_first} alone"
+        # The row we settled for may carry a range of its own, and naming it is
+        # the difference between "we guessed" and "17-99 is stored as 17-23".
+        stored = (
+            f"{chosen.number_first}-{chosen.number_last}"
+            if chosen is not None and chosen.number_last
+            else ""
         )
+        warnings.append(
+            f"no G-NAF row for the range {number_first}-{number_last}; "
+            f"matched {number_first} alone"
+            + (f", whose stored range is {stored}" if stored else "")
+        )
+        cap = _tighter(cap, RANGE_MISMATCH_CONFIDENCE_CAP)
     if chosen is None:
         return _result(Granularity.STREET, s_lat, s_lng, None, warnings, hypothesis, trips, cap)
 
