@@ -59,6 +59,10 @@ DEPLOYED_SHA_FILE="${LOCATRON_DEPLOYED_SHA_FILE:-$(dirname "$APP_DIR")/.deployed
 # Services whose restart counts as deploying the code.
 SERVICES=(locatron-api locatron-bulk)
 
+# Kept before the parse loop shifts them away, so a re-exec after deploy.sh
+# updates itself can pass on exactly what this run was invoked with.
+ORIGINAL_ARGS=("$@")
+
 SKIP_TESTS=0
 FORCE=0
 NO_CONFIG=0
@@ -492,6 +496,16 @@ say "Fetching"
 
 OLD_SHA=$(as_app git -C "$APP_DIR" rev-parse HEAD)
 
+# A copy of this script as bash started reading it. bash reads a script
+# incrementally, not all at once, so a fetch that rewrites deploy.sh underneath a
+# running deploy makes the rest of the run a mix of old and new lines. That is
+# what happened on the first live deploy of the .deployed-sha change: the fetch
+# brought in the version that records the SHA, the tail bash had already buffered
+# did not, and no record was written.
+SELF_BEFORE=$(new_tmp)
+TMP_FILES+=("$SELF_BEFORE")
+cat "$0" > "$SELF_BEFORE"
+
 as_app git -C "$APP_DIR" fetch --prune origin
 
 as_app git -C "$APP_DIR" rev-parse --verify --quiet "origin/$BRANCH" >/dev/null \
@@ -503,6 +517,34 @@ as_app git -C "$APP_DIR" checkout -B "$BRANCH" --quiet "origin/$BRANCH"
 as_app git -C "$APP_DIR" reset --hard --quiet "origin/$BRANCH"
 
 NEW_SHA=$(as_app git -C "$APP_DIR" rev-parse HEAD)
+
+# Line endings first: the hand-over below runs the file just fetched, and bash
+# rejects a shebang with a trailing CR.
+# Repair CRLF endings on scripts committed from Windows before .gitattributes
+# landed. Left alone, bash rejects the shebang on the next run.
+if grep -qlr $'\r$' "$APP_DIR"/deploy/*.sh 2>/dev/null; then
+    info "fixing CRLF line endings in deploy scripts"
+    as_app sed -i 's/\r$//' "$APP_DIR"/deploy/*.sh
+fi
+as_app chmod +x "$APP_DIR"/deploy/*.sh 2>/dev/null || true
+
+# If this script changed in that fetch, give the rest of the deploy to the new
+# copy rather than finishing as a hybrid of both. Before the shortcut, so the
+# new version's rules -- not the old one's -- decide whether there is anything
+# to do.
+if ! cmp -s "$0" "$SELF_BEFORE"; then
+    if [[ -n "${LOCATRON_DEPLOY_REEXECED:-}" ]]; then
+        # Already handed over once. A second change in one run means two deploys
+        # are racing or something outside git is rewriting the file; either way,
+        # looping forever is worse than carrying on and saying so.
+        info "deploy.sh changed again after the hand-over, continuing with this copy"
+    else
+        info "deploy.sh changed in this fetch, re-executing the new version"
+        cleanup_tmp            # exec does not run the EXIT trap
+        export LOCATRON_DEPLOY_REEXECED=1
+        exec bash "$0" ${ORIGINAL_ARGS[@]+"${ORIGINAL_ARGS[@]}"}
+    fi
+fi
 
 DEPLOYED_SHA=$(deployed_sha)
 
@@ -543,14 +585,6 @@ if [[ "$OLD_SHA" == "$NEW_SHA" ]] && (( ! FORCE )); then
 fi
 
 info "${OLD_SHA:0:7} -> ${NEW_SHA:0:7}  $(as_app git -C "$APP_DIR" log -1 --format=%s | cut -c1-55)"
-
-# Repair CRLF endings on scripts committed from Windows before .gitattributes
-# landed. Left alone, bash rejects the shebang on the next run.
-if grep -qlr $'\r$' "$APP_DIR"/deploy/*.sh 2>/dev/null; then
-    info "fixing CRLF line endings in deploy scripts"
-    as_app sed -i 's/\r$//' "$APP_DIR"/deploy/*.sh
-fi
-as_app chmod +x "$APP_DIR"/deploy/*.sh 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 

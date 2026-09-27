@@ -184,6 +184,12 @@ fetched and then failed before the restart left the checkout looking perfect whi
 production kept serving the previous commit — and every later run reported nothing
 to do. Production was a day stale that way once.
 
+If the fetch changes `deploy.sh` itself, the run hands over to the new copy with
+`exec` before doing anything else. bash reads a script incrementally rather than
+all at once, so without that a deploy that updates deploy.sh finishes as a mix of
+old and new lines — which is how the first live deploy of `.deployed-sha` fetched
+the code that writes the record and then ran the tail that does not.
+
 To ask what is running without deploying anything:
 
 ```bash

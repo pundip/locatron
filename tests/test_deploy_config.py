@@ -761,3 +761,115 @@ report "$rc"
     assert rc == 0, out
     assert "Current" in out
     assert "WARNING" not in out
+
+
+# ---------------------------------------------------------------------------
+# deploy.sh updating itself mid-run
+# ---------------------------------------------------------------------------
+
+
+def test_a_fetch_that_changes_deploy_sh_hands_over_to_the_new_copy() -> None:
+    """bash reads a script incrementally, so a fetch that rewrites deploy.sh
+    underneath a running deploy leaves the rest of the run a mix of old and new
+    lines.
+
+    That is not hypothetical: the first live deploy of the .deployed-sha change
+    fetched the version that records the SHA and then finished on the tail bash
+    had already buffered, so no record was written and the next run reported
+    nothing to do.
+
+    Here origin carries a deploy.sh with an extra marker line. The running copy
+    must hand over rather than finish itself.
+    """
+    rc, out, _ = _run_fetch(
+        r"""
+enable_services
+rm -f "$DSHA"
+: > "$MIRROR_PATH"
+
+# A commit on origin that changes deploy.sh, exactly as a real deploy would.
+ORIGIN="$WORK/origin"
+git clone -q --bare "$APP" "$ORIGIN"
+git -C "$APP" remote set-url origin "$ORIGIN"
+CLONE="$WORK/clone"
+git clone -q "$ORIGIN" "$CLONE"
+git -C "$CLONE" config user.email t@t
+git -C "$CLONE" config user.name t
+printf '\ninfo "MARKER from the new copy"\n' >> "$CLONE/deploy/deploy.sh"
+git -C "$CLONE" commit -qam "change deploy.sh"
+git -C "$CLONE" push -q origin master
+
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "deploy.sh changed in this fetch, re-executing the new version" in out
+    # Proof the new copy ran: the marker only exists in the fetched version.
+    assert "MARKER from the new copy" in out
+    # And the run it handed over to completed, which the broken case never did.
+    assert "recorded" in out
+
+
+def test_the_hand_over_passes_the_original_arguments_on() -> None:
+    """--branch, --skip-tests and the rest have to survive the hand-over, or the
+    new copy deploys something other than what was asked for.
+
+    The marker reads ORIGINAL_ARGS rather than $*, because by the time any line
+    near the end of the script runs, the parse loop has shifted $@ away -- which
+    is exactly why the arguments have to be saved up front to be passed on.
+    """
+    rc, out, calls = _run_fetch(
+        r"""
+enable_services
+rm -f "$DSHA"
+: > "$MIRROR_PATH"
+ORIGIN="$WORK/origin"
+git clone -q --bare "$APP" "$ORIGIN"
+git -C "$APP" remote set-url origin "$ORIGIN"
+CLONE="$WORK/clone"
+git clone -q "$ORIGIN" "$CLONE"
+git -C "$CLONE" config user.email t@t
+git -C "$CLONE" config user.name t
+printf '\ninfo "MARKER args=${ORIGINAL_ARGS[*]}"\n' >> "$CLONE/deploy/deploy.sh"
+git -C "$CLONE" commit -qam "change deploy.sh"
+git -C "$CLONE" push -q origin master
+
+rc=0; run_deploy --no-mirror --branch master || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "MARKER args=--no-mirror --branch master" in out
+
+
+def test_the_hand_over_does_not_loop() -> None:
+    """A guard against the obvious way to get this wrong. With the marker already
+    set, a changed deploy.sh must carry on rather than exec itself forever."""
+    rc, out, _ = _run_fetch(
+        r"""
+enable_services
+mark_deployed
+: > "$MIRROR_PATH"
+# Pretend a hand-over already happened, and make the copy differ from disk by
+# editing the file after the run has started reading it is not possible here --
+# so drive the guard directly with a checkout whose deploy.sh differs from HEAD.
+ORIGIN="$WORK/origin"
+git clone -q --bare "$APP" "$ORIGIN"
+git -C "$APP" remote set-url origin "$ORIGIN"
+CLONE="$WORK/clone"
+git clone -q "$ORIGIN" "$CLONE"
+git -C "$CLONE" config user.email t@t
+git -C "$CLONE" config user.name t
+printf '\ninfo "MARKER second copy"\n' >> "$CLONE/deploy/deploy.sh"
+git -C "$CLONE" commit -qam "change deploy.sh"
+git -C "$CLONE" push -q origin master
+
+rc=0; LOCATRON_DEPLOY_REEXECED=1 run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "changed again after the hand-over, continuing with this copy" in out
+    assert "re-executing the new version" not in out
+    assert "MARKER second copy" not in out, "the old copy must finish the run"
