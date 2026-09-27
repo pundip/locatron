@@ -52,8 +52,8 @@ NON_AU_INPUTS = tuple(r["input"] for r in ROWS if r["expected_country"] != "AUS"
 
 def test_golden_set_shape_is_unchanged() -> None:
     """Guards the tables below against drift in golden.csv."""
-    assert len(ROWS) == 30, f"golden.csv now has {len(ROWS)} rows"
-    assert len(AU_INPUTS) == 20
+    assert len(ROWS) == 32, f"golden.csv now has {len(ROWS)} rows"
+    assert len(AU_INPUTS) == 22
     assert len(NON_AU_INPUTS) == 10
 
 
@@ -67,9 +67,11 @@ EXPECTED_POSTCODES: dict[str, list[str]] = {
     # --- AU address rows, the ones phase 2 has to parse ---
     "65 clifton park drive 3201 carrum downs": ["3201"],
     "65 Clifton Park Dr Carrum Downs VIC 3201": ["3201"],
-    "5/12 Smith Street Fitzroy VIC 3065": ["3065"],
-    "Unit 5 12 Smith Street Fitzroy 3065": ["3065"],
-    "14-40 Wills Street Melbourne VIC 3000": ["3000"],
+    "5/1 Smith Street Fitzroy VIC 3065": ["3065"],
+    "Unit 5 1 Smith Street Fitzroy 3065": ["3065"],
+    "101/7 Smith Street Fitzroy VIC 3065": ["3065"],
+    "17-23 Wills Street Melbourne VIC 3000": ["3000"],
+    "17-99 Wills Street Melbourne VIC 3000": ["3000"],
     "Clifton Park Drive Carrum Downs": [],
     "Carrum Downs VIC": [],
     "3201": ["3201"],
@@ -292,8 +294,10 @@ def test_no_po_box_in_rows_that_have_none(raw: str) -> None:
 
 #: The only two golden rows with a sub-dwelling, as (kind, value, keyword, hint).
 EXPECTED_UNITS: dict[str, list[tuple[str, str, str | None, str | None]]] = {
-    "5/12 Smith Street Fitzroy VIC 3065": [("unit", "5", None, "12")],
-    "Unit 5 12 Smith Street Fitzroy 3065": [("unit", "5", "UNIT", None)],
+    "5/1 Smith Street Fitzroy VIC 3065": [("unit", "5", None, "1")],
+    "Unit 5 1 Smith Street Fitzroy 3065": [("unit", "5", "UNIT", None)],
+    # A three-digit flat number, which is what 7 Smith St actually has.
+    "101/7 Smith Street Fitzroy VIC 3065": [("unit", "101", None, "7")],
 }
 
 
@@ -427,13 +431,15 @@ def test_slash_form_consumes_only_its_own_token() -> None:
 EXPECTED_NUMBERS: dict[str, list[tuple[str, str | None, bool]]] = {
     "65 clifton park drive 3201 carrum downs": [("65", None, False), ("3201", None, False)],
     "65 Clifton Park Dr Carrum Downs VIC 3201": [("65", None, False), ("3201", None, False)],
-    "5/12 Smith Street Fitzroy VIC 3065": [("12", None, True), ("3065", None, False)],
-    "Unit 5 12 Smith Street Fitzroy 3065": [
+    "5/1 Smith Street Fitzroy VIC 3065": [("1", None, True), ("3065", None, False)],
+    "Unit 5 1 Smith Street Fitzroy 3065": [
         ("5", None, False),
-        ("12", None, False),
+        ("1", None, False),
         ("3065", None, False),
     ],
-    "14-40 Wills Street Melbourne VIC 3000": [("14", "40", False), ("3000", None, False)],
+    "101/7 Smith Street Fitzroy VIC 3065": [("7", None, True), ("3065", None, False)],
+    "17-23 Wills Street Melbourne VIC 3000": [("17", "23", False), ("3000", None, False)],
+    "17-99 Wills Street Melbourne VIC 3000": [("17", "99", False), ("3000", None, False)],
     "3201": [("3201", None, False)],
     "PO Box 45 World Square NSW 2002": [("45", None, False), ("2002", None, False)],
     "Ryde NSW 2112": [("2112", None, False)],

@@ -39,7 +39,11 @@ from locatron.parse.locality import StateToken, find_state_tokens, generate_hypo
 from locatron.parse.lookup import GnafRecord, LookupResult, lookup
 from locatron.parse.lookup import Granularity as Rung
 from locatron.parse.scoring import au_confidence
-from locatron.parse.street import StreetHypothesis, resolve_streets
+from locatron.parse.street import (
+    StreetHypothesis,
+    codes_for_token,
+    resolve_streets,
+)
 from locatron.parse.tokens import Span, TokenStream, tokenize
 from locatron.schemas import (
     Admin1,
@@ -165,6 +169,39 @@ class AuParse:
         return self.hypotheses[1].score if len(self.hypotheses) > 1 else None
 
 
+def _no_streets(_keys: Any) -> dict[Any, tuple[Any, ...]]:
+    """A street store with nothing in it, for when the query cannot matter."""
+    return {}
+
+
+def cheap_triggers(components: Components, states: tuple[StateToken, ...]) -> bool:
+    """Whether a trigger has fired that needs no street matching to see.
+
+    A postcode, a stated state and a PO box are all pure token work, so they are
+    known before the gazetteer is touched.
+    """
+    return bool(components.postcodes) or bool(components.boxes) or any(s.strong for s in states)
+
+
+def could_match_a_street(ts: TokenStream, components: Components) -> bool:
+    """Whether a street match could change the routing decision.
+
+    Both street triggers need something visible in the tokens: `number+street`
+    needs a street number, and `street+type` needs a token that denotes a street
+    type. Without either, no street match can route the input here, so fetching a
+    locality's streets is pure cost -- and not a small one, because the query
+    returns every street in the locality. MELBOURNE's took 3.8 ms to fetch and
+    match on 'Greater Melbourne', which is a place name with no street in it.
+    """
+    if components.numbers:
+        return True
+    return any(
+        codes_for_token(token.text)
+        for token in ts
+        if not any(Span(token.index, token.index + 1).overlaps(c) for c in components.claimed)
+    )
+
+
 def parse(text: str, au: AuGazetteer | None = None, **street_kwargs: Any) -> AuParse:
     """Run every stage up to but not including the address_ref lookup.
 
@@ -176,14 +213,34 @@ def parse(text: str, au: AuGazetteer | None = None, **street_kwargs: Any) -> AuP
     ts = tokenize(text)
     components = extract_components(ts, known_postcodes())
     states = find_state_tokens(ts, gaz)
+    cheap = cheap_triggers(components, states)
+
+    # The fuzzy locality sweep runs rapidfuzz over ~16k keys per n-gram, and it
+    # only runs when nothing matched exactly -- which is exactly what a
+    # non-Australian input looks like. 'Las Vegas' spent 51 ms failing to be an
+    # Australian suburb, on the path CLAUDE.md's first use case is built around.
+    #
+    # It is skipped unless a postcode, a stated state or a PO box says the input
+    # is Australian, because without one of those a fuzzy locality cannot route
+    # here on its own: the only remaining triggers are the street ones, and a
+    # street needs a locality whose streets we can fetch, which an exact or alias
+    # hit already provides. The cost is that a misspelled suburb carrying neither
+    # a postcode nor a state nor a number now answers from the world gazetteer
+    # instead, which does its own fuzzy matching.
     hyps = generate_hypotheses(
         ts,
         gaz,
         consumed=components.claimed,
         postcodes=components.postcodes,
         po_box_found=bool(components.boxes),
-        fuzzy_min=FUZZY_MIN,
+        fuzzy_min=FUZZY_MIN if cheap else None,
     )
+    # Skip the street fetch when no street match could route this input. The
+    # hypotheses still come back wrapped, with street=None, so routing and the
+    # ladder behave exactly as they would have -- neither street trigger can fire
+    # without a number or a type word, which is the condition being tested.
+    if "source" not in street_kwargs and not (cheap or could_match_a_street(ts, components)):
+        street_kwargs["source"] = _no_streets
     joint = resolve_streets(ts, hyps, consumed=components.claimed, **street_kwargs)
     return AuParse(
         text=text,

@@ -70,13 +70,31 @@ def test_a_world_place_stays_on_the_world_path(
 
 @needs_stores
 def test_new_york_does_not_become_a_street_in_york_wa() -> None:
-    """The case that rules out a bare street match as a trigger. 'New York'
-    matches street NEW ST in locality YORK at a healthy score with nothing left
-    unexplained, so only the type-word and number requirements keep it out."""
+    """The case that rules out a bare street match as a trigger.
+
+    Two things are true and both matter. A street really does match -- NEW ST in
+    locality YORK, at a healthy score with nothing left unexplained -- which is
+    why a bare street match cannot be a trigger. And the resolver never even asks,
+    because 'New York' has no street number and no street-type word, so the street
+    query is skipped.
+
+    The first half is asserted by forcing the street stage on, so the danger stays
+    proven even though the fast path no longer walks into it.
+    """
+    from locatron.parse.street import streets_for_many
+
+    forced = au_path.parse("New York", source=streets_for_many)
+    assert forced.top is not None and forced.top.street is not None, "a street does match"
+    assert forced.top.street.row.street_key == "NEW ST"
+    assert forced.top.locality.candidate.locality == "YORK"
+    assert not forced.top.unexplained, "and it explains every token"
+    assert au_path.triggers(forced) == (), "yet nothing routes it here"
+
+    # The path actually taken: no number, no type word, so no query at all.
     p = au_path.parse("New York")
-    assert p.top is not None and p.top.street is not None, "premise: a street does match"
-    assert p.top.street.reading == "whole-name", "no type word came from the input"
-    assert au_path.triggers(p) == ()
+    assert au_path.could_match_a_street(p.ts, p.components) is False
+    assert p.top is not None and p.top.street is None
+    assert au_path.takes_au_path(p) == (False, "no AU signal")
     assert _resolve("New York").granularity is Granularity.CITY
 
 
@@ -310,3 +328,48 @@ def test_a_fuzzy_locality_reaching_past_the_state_token_is_still_allowed() -> No
     assert h.locality_span.overlaps(h.state_span), "it does overlap"
     assert not h.locality_span.within(h.state_span), "but it reaches beyond"
     assert au_path.takes_au_path(p)[0] is True
+
+
+# ---------------------------------------------------------------------------
+# the work that gets skipped
+# ---------------------------------------------------------------------------
+
+
+@needs_stores
+@pytest.mark.parametrize("raw", ["Greater Melbourne", "Las Vegas", "Delhi", "London", "New York"])
+def test_a_world_input_does_not_pay_for_the_australian_stages(raw: str) -> None:
+    """Wiring the AU parser in front of the world path made 'Las Vegas' spend
+    51 ms failing to be an Australian suburb, on the path CLAUDE.md's first use
+    case is built around. Neither expensive stage can change the routing decision
+    for an input like this, so neither runs.
+    """
+    p = au_path.parse(raw)
+    assert au_path.cheap_triggers(p.components, p.states) is False
+    assert au_path.could_match_a_street(p.ts, p.components) is False
+    # No street fetch: every hypothesis came back without one.
+    assert all(h.street is None for h in p.hypotheses)
+    assert au_path.triggers(p) == ()
+
+
+@needs_stores
+@pytest.mark.parametrize(
+    ("raw", "why"),
+    [
+        ("Clifton Park Drive Carrum Downs", "DRIVE is a street-type word"),
+        ("12 Clifton Street 3201", "a street number is present"),
+        ("65 Clifton Park Dr Carrum Downs VIC 3201", "both"),
+    ],
+)
+def test_an_input_that_could_name_a_street_still_gets_the_street_stage(raw: str, why: str) -> None:
+    p = au_path.parse(raw)
+    assert au_path.could_match_a_street(p.ts, p.components) is True, why
+    assert p.top is not None and p.top.street is not None
+
+
+@needs_stores
+def test_the_fuzzy_sweep_runs_when_the_input_says_it_is_australian() -> None:
+    """The other side of the skip: 'Ku-ring-gai NSW' needs the fuzzy pass to reach
+    KU-RING-GAI CHASE, and its state token is what earns it."""
+    p = au_path.parse("Ku-ring-gai NSW")
+    assert au_path.cheap_triggers(p.components, p.states) is True
+    assert p.top is not None and p.top.locality.candidate.match == "fuzzy"
