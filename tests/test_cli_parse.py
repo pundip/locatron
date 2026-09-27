@@ -185,3 +185,43 @@ def test_the_slash_token_is_labelled_as_the_compound_it_is() -> None:
     result = runner.invoke(app, ["parse", "5/12 Smith Street Fitzroy VIC 3065"])
     assert result.exit_code == 0, result.output
     assert _roles(result.output)["5/12"] == "unit 5 + number 12"
+
+
+@needs_stores
+def test_parse_prints_the_lookup_for_the_winner() -> None:
+    """The phase 2 report needs the G-NAF record, not just the hypothesis."""
+    result = runner.invoke(app, ["parse", "65 clifton park drive 3201 carrum downs"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "lookup (winner)" in out
+    assert "granularity  address" in out
+    assert "65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201" in out
+    assert "round trips  1" in out
+    # Full G-NAF columns, not a summary.
+    for label in ("pid", "number", "street", "locality", "geocode"):
+        assert f"    {label:<11}" in out, label
+
+
+@needs_stores
+@pytest.mark.parametrize(
+    ("raw", "granularity", "trips"),
+    [
+        ("Carrum Downs VIC", "locality", "0"),
+        ("Clifton Park Drive Carrum Downs", "street", "0"),
+        ("PO Box 45 World Square NSW 2002", "postal", "0"),
+        ("65 clifton park drive 3201 carrum downs", "address", "1"),
+    ],
+)
+def test_parse_reports_each_rung_of_the_ladder(raw: str, granularity: str, trips: str) -> None:
+    result = runner.invoke(app, ["parse", raw])
+    assert result.exit_code == 0, result.output
+    assert f"granularity  {granularity}" in result.output
+    assert f"round trips  {trips}" in result.output
+
+
+@needs_stores
+def test_parse_shows_the_confidence_cap_on_a_substituted_type() -> None:
+    result = runner.invoke(app, ["parse", "12 Clifton Street 3201"])
+    assert result.exit_code == 0, result.output
+    assert "confidence   capped at 0.7" in result.output
+    assert "street type substituted" in result.output

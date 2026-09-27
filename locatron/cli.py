@@ -414,6 +414,62 @@ def _extract_components(ts, known_postcodes):
     return boxes, units, postcodes, numbers, claimed
 
 
+def _lookup_lines(top, units, numbers, boxes) -> list[str]:
+    """The G-NAF lookup for the winning hypothesis.
+
+    Read-only and index-backed. Costs zero MySQL round trips for a street,
+    locality or postal answer, one for an address or unit, and two only when an
+    alias has to be followed; the count is printed so the budget is visible.
+    """
+    from locatron.parse.lookup import lookup
+
+    number = numbers[0] if numbers else None
+    unit = next((u.value for u in units if u.kind == "unit"), None)
+    result = lookup(
+        top,
+        number_first=number.number_first if number else None,
+        number_last=number.number_last if number else None,
+        unit=unit,
+        po_box=bool(boxes),
+    )
+
+    coord = f"{result.lat}, {result.lng}" if result.lat is not None else "-"
+    out = [
+        "lookup (winner)",
+        f"  granularity  {result.granularity}",
+        f"  coordinates  {coord}",
+        f"  round trips  {result.round_trips}",
+    ]
+    if result.confidence_cap is not None:
+        out.append(f"  confidence   capped at {result.confidence_cap}")
+
+    r = result.record
+    if r is not None:
+        out.append(f"  G-NAF        {r.address_label}")
+        for label, value in (
+            ("pid", r.address_detail_pid),
+            ("flat", f"{r.flat_type} {r.flat_number}".strip()),
+            ("level", f"{r.level_type} {r.level_number}".strip()),
+            ("number", f"{r.number_first}{'-' + r.number_last if r.number_last else ''}"),
+            ("lot", r.lot_number),
+            ("street", f"{r.street_name} {r.street_type} {r.street_suffix}".strip()),
+            ("locality", f"{r.locality_name} {r.state} {r.postcode}"),
+            ("building", r.building_name),
+            ("site", r.address_site_name),
+            ("alias", f"{r.alias_principal} {r.principal_pid}".strip()),
+            ("primary", f"{r.primary_secondary} {r.primary_pid}".strip()),
+            ("geocode", r.geocode_type),
+            ("mb_code", r.mb_code),
+            ("parcel", r.legal_parcel_id),
+            ("created", r.date_created),
+        ):
+            if value:
+                out.append(f"    {label:<11}{value}")
+    for w in result.warnings:
+        out.append(f"  ! {w}")
+    return out
+
+
 def _token_roles(ts, winner, boxes, units, postcodes, numbers) -> list[str]:
     """One role per token, resolved against the winning hypothesis.
 
@@ -553,6 +609,7 @@ def _parse_one(text_in: str, au, known_postcodes) -> list[str]:
 
     top = joint[0]
     out.extend(_token_roles(ts, top, boxes, units, postcodes, numbers))
+    out.extend(_lookup_lines(top, units, numbers, boxes))
     out.append("breakdown (top)")
     listed = [k for k in _SIGNAL_ORDER if k in top.signals]
     extra = sorted(k for k in top.signals if k not in _SIGNAL_ORDER)
