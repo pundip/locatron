@@ -252,3 +252,110 @@ def address_keys(
 ) -> list[AddressKey]:
     """Keys to try, in order. Used by the range ladder in the next stage."""
     return [(locality, street_name, street_type, n) for n in numbers]
+
+
+# ---------------------------------------------------------------------------
+# tie-break, units and ranges
+# ---------------------------------------------------------------------------
+#
+# All of this runs in Python on the handful of rows one street number returns,
+# not in an ORDER BY. The rules are easier to read and to test here, and the
+# candidate set is 1 to 7 rows.
+
+#: PRIMARY_SECONDARY preference. Blank is the ordinary case, not missing data:
+#: 10,414,829 rows are blank against 4,966,618 'S' and 568,096 'P'. So a blank
+#: standalone address outranks a secondary row, and a group's head outranks both.
+_PRIMARY_RANK = {"P": 0, "": 1, "S": 2}
+
+#: ALIAS_PRINCIPAL preference. 'P' is principal, 'A' is an alias pointing at one
+#: through PRINCIPAL_PID. Never the words: 'PRINCIPAL' matches nothing.
+_ALIAS_RANK = {"P": 0, "A": 1}
+
+
+def _rank(record: GnafRecord) -> tuple[int, int, str]:
+    """Sort key for choosing between rows at the same street number.
+
+    Principal before alias, then the PRIMARY_SECONDARY preference, then the pid
+    so two runs never disagree.
+    """
+    return (
+        _ALIAS_RANK.get(record.alias_principal, 9),
+        _PRIMARY_RANK.get(record.primary_secondary, 9),
+        record.address_detail_pid,
+    )
+
+
+def best_without_unit(records: Sequence[GnafRecord]) -> GnafRecord | None:
+    """The row to return when the input named no unit.
+
+    Prefers a principal over an alias, then 'P' over blank over 'S'. A building
+    with units returns the building rather than an arbitrary flat, because the
+    'P' row is the one without a FLAT_NUMBER.
+    """
+    if not records:
+        return None
+    return sorted(records, key=_rank)[0]
+
+
+def match_unit(records: Sequence[GnafRecord], unit: str) -> GnafRecord | None:
+    """The row whose FLAT_NUMBER is `unit`, regardless of indicator.
+
+    Indicator-blind on purpose: a unit is almost always an 'S' row, so ranking
+    by PRIMARY_SECONDARY first would pick the building and miss the flat. Among
+    several rows sharing a FLAT_NUMBER the usual rank breaks the tie.
+    """
+    if not unit:
+        return None
+    hits = [r for r in records if r.flat_number == unit]
+    if not hits:
+        return None
+    return sorted(hits, key=_rank)[0]
+
+
+def match_range(
+    records: Sequence[GnafRecord], number_last: str | None
+) -> tuple[GnafRecord | None, bool]:
+    """(row, exact) for a number range.
+
+    '14-40' wants the row whose NUMBER_FIRST is 14 and NUMBER_LAST is 40. When no
+    row carries that range, the first half alone is the next best answer -- the
+    caller has already narrowed to NUMBER_FIRST, so those rows are in hand and
+    cost nothing. `exact` says which happened, so a warning can name it.
+    """
+    if not records:
+        return None, False
+    if number_last is None:
+        return best_without_unit(records), True
+
+    exact = [r for r in records if r.number_last == number_last]
+    if exact:
+        return sorted(exact, key=_rank)[0], True
+    return best_without_unit(records), False
+
+
+def follow_alias(
+    record: GnafRecord, principal: PrincipalSource
+) -> tuple[GnafRecord, tuple[str, ...]]:
+    """Resolve an alias row to its principal, or keep the alias if it dangles.
+
+    An alias row is a real answer -- the input used a name G-NAF records as an
+    alias -- so it is never discarded. It is followed, because the principal is
+    the canonical record and the one a consumer should store. 5.27% of rows are
+    aliases.
+    """
+    if not record.is_alias:
+        return record, ()
+
+    target = principal(record.principal_pid)
+    if target is None:
+        return record, (
+            f"matched an alias record ({record.address_detail_pid}) whose "
+            f"principal {record.principal_pid!r} could not be found; returning "
+            f"the alias",
+        )
+    alias_name = " ".join(x for x in (record.street_name, record.street_type) if x)
+    principal_name = " ".join(x for x in (target.street_name, target.street_type) if x)
+    return target, (
+        f"input used the alias street {alias_name!r}; returned the principal "
+        f"record {principal_name!r} ({target.address_detail_pid})",
+    )
