@@ -90,17 +90,22 @@ AU_CASES = [
     "17-99 Wills Street Melbourne VIC 3000",
 ]
 
+#: (input, expected granularity) for the deployed API. A 200 is not a pass: the
+#: point of hitting production is to catch it answering differently from this
+#: checkout, and "it responded" cannot see that. au_address is asserted from the
+#: granularity rather than listed per row, because non-null for exactly unit and
+#: address is the envelope's documented contract.
 LIVE_CASES = [
-    "Greater Melbourne",
-    "Sydney Australia",
-    "Las Vegas",
-    "Delhi",
-    "Carrum Downs VIC",
-    "3201",
-    # The AU address path end to end, which the world-place cases above never
-    # touch: a full G-NAF record, and a unit reached through the spelled form.
-    "65 Clifton Park Dr Carrum Downs VIC 3201",
-    "Unit 5 1 Smith Street Fitzroy 3065",
+    ("Greater Melbourne", "city"),
+    ("Sydney Australia", "city"),
+    ("Las Vegas", "city"),
+    ("Delhi", "city"),
+    ("Carrum Downs VIC", "locality"),
+    ("3201", "postcode"),
+    # The AU address path end to end, which the world-place cases never touch: a
+    # container with a missing or stale street mirror passes every row above.
+    ("65 Clifton Park Dr Carrum Downs VIC 3201", "address"),
+    ("Unit 5 1 Smith Street Fitzroy 3065", "unit"),
 ]
 
 DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) locatron-report/1"
@@ -378,6 +383,34 @@ def _compact(body: str, limit: int = 600) -> str:
     return text if len(text) <= limit else text[:limit] + " ...[truncated]"
 
 
+def _live_problems(body: str, want: str) -> list[str]:
+    """Everything wrong with one live response, as readable lines.
+
+    Returns them all rather than the first, so one run says whether the deployment
+    is wrong in one way or several.
+    """
+    try:
+        payload = json.loads(body)
+    except Exception as exc:
+        return [f"response was not JSON ({type(exc).__name__})"]
+
+    problems = []
+    got = payload.get("granularity")
+    if got != want:
+        problems.append(f"granularity want={want} got={got}")
+
+    # Non-null for exactly unit and address is the envelope's contract, so this
+    # catches both a missing record and one attached to an answer with no row
+    # behind it.
+    has_record = payload.get("au_address") is not None
+    if want in ("unit", "address") and not has_record:
+        problems.append("au_address is null, but this granularity means a G-NAF row matched")
+    if want not in ("unit", "address") and has_record:
+        problems.append(f"au_address is set on a {want} answer, which has no single row behind it")
+
+    return problems
+
+
 def section_live(report: Report, base_url: str, headers: dict[str, str]) -> None:
     started = time.perf_counter()
     base = base_url.rstrip("/")
@@ -390,7 +423,8 @@ def section_live(report: Report, base_url: str, headers: dict[str, str]) -> None
     if code != 200:
         failures += 1
 
-    for text in LIVE_CASES:
+    mismatches = 0
+    for text, want in LIVE_CASES:
         url = f"{base}/v1/resolve?text={urllib.parse.quote_plus(text)}"
         code, ms, body = _http_get(url, headers)
         if code == 200:
@@ -398,13 +432,18 @@ def section_live(report: Report, base_url: str, headers: dict[str, str]) -> None
         else:
             failures += 1
         lines.append(f"GET /v1/resolve?text={text!r} -> {code} in {ms:.0f} ms\n  {_compact(body)}")
+        if code != 200:
+            continue
+        for problem in _live_problems(body, want):
+            mismatches += 1
+            lines.append(f"  MISMATCH {text!r}: {problem}")
 
-    note = f"{failures} non-200 responses"
+    note = f"{failures} non-200 responses, {mismatches} wrong answers"
     if timings:
         note += f"; median {statistics.median(timings):.0f} ms round trip"
     if any(" -> 403 " in line for line in lines):
         note += "; 403 is likely Cloudflare bot protection"
-    status = "PASS" if failures == 0 else "FAIL"
+    status = "PASS" if failures == 0 and mismatches == 0 else "FAIL"
     report.add(f"live API ({base})", status, time.perf_counter() - started, note, fence("\n\n".join(lines)))
 
 
