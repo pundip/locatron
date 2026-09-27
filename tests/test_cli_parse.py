@@ -221,10 +221,25 @@ def test_parse_reports_each_rung_of_the_ladder(raw: str, granularity: str, trips
 
 @needs_stores
 def test_parse_shows_the_confidence_cap_on_a_substituted_type() -> None:
-    result = runner.invoke(app, ["parse", "12 Clifton Street 3201"])
+    """'Richmond Road 3201' reaches RICHMOND AV in Carrum Downs. No number was
+    given, so the substitution is the only doubt and its 0.70 is what binds."""
+    result = runner.invoke(app, ["parse", "Richmond Road 3201"])
     assert result.exit_code == 0, result.output
     assert "confidence   capped at 0.7" in result.output
     assert "street type substituted" in result.output
+
+
+@needs_stores
+def test_parse_shows_the_tighter_cap_when_two_doubts_apply() -> None:
+    """'12 Clifton Street 3201' substitutes a street type AND finds no row at
+    number 12 on CLIFTON GR, so the report must show 0.6 rather than the 0.7 the
+    substitution alone would give."""
+    result = runner.invoke(app, ["parse", "12 Clifton Street 3201"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "confidence   capped at 0.6" in out
+    assert "street type substituted" in out
+    assert "no G-NAF row for number 12" in out
 
 
 @needs_stores

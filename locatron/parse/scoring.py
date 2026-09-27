@@ -323,3 +323,48 @@ STREET_MATCH_WEIGHT = 1.20
 #: shorter one plus a loose end, and below BASE_EXACT so a single stray token
 #: cannot annihilate an otherwise good parse.
 UNEXPLAINED_TOKEN_PENALTY = -0.60
+
+
+# ---------------------------------------------------------------------------
+# calibration
+# ---------------------------------------------------------------------------
+
+
+#: What a fully corroborated answer scores when a street was confirmed too.
+#: `SCORE_FULL` is the locality-only reference, so measuring an address against
+#: it saturates: every address in the golden set scores 3.4 to 4.2 against a
+#: 2.75 reference and would read as certain whatever else was wrong. Adding the
+#: street term is what makes 'Clifton Park Drive Carrum Downs' (2.74, no
+#: postcode and no state) come out below '65 Clifton Park Dr Carrum Downs VIC
+#: 3201' (4.14, everything corroborating) instead of both reading 1.00.
+SCORE_FULL_WITH_STREET = SCORE_FULL + STREET_MATCH_WEIGHT
+
+
+def au_confidence(
+    score: float,
+    runner_up: float | None,
+    *,
+    has_street: bool,
+    cap: float | None = None,
+    w: Weights = DEFAULT_WEIGHTS,
+) -> float:
+    """Confidence for an AU answer: score and margin onto 0..1, then the cap.
+
+    The same two reductions as `confidence()` -- how fully corroborated the
+    winner is, and how close the runner-up came -- measured against the right
+    reference for whether a street was confirmed.
+
+    The cap is applied last and as a ceiling, so a doubt about *what* was matched
+    (a substituted street type, a range that is not the stored one, a missing
+    flat, an alias row) cannot be argued away by a strong parse. Lowering a
+    number that is already lower would be the other way round, which is why it
+    is a min and not a multiplier.
+    """
+    full = SCORE_FULL_WITH_STREET if has_street else w.score_full
+    absolute = max(0.0, min(1.0, score / full)) if full else 0.0
+    if runner_up is None or score <= 0.0:
+        calibrated = absolute
+    else:
+        margin = max(0.0, (score - runner_up) / score)
+        calibrated = absolute * (1.0 - w.ambiguity_penalty_max * (1.0 - min(margin, 1.0)))
+    return round(min(calibrated, cap) if cap is not None else calibrated, 4)

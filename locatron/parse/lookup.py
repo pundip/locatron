@@ -408,6 +408,33 @@ SUBSTITUTED_TYPE_CONFIDENCE_CAP = 0.70
 #: nothing about extent, so nothing caps it.
 RANGE_MISMATCH_CONFIDENCE_CAP = 0.75
 
+#: Ceiling when a unit was asked for, the building was found and that flat was
+#: not. The building is still the right answer to return -- it is where the
+#: address is -- but it is not the address that was asked for, and 'Unit 9 1
+#: Smith Street Fitzroy' where the flats run 1 to 6 should not read as a hit.
+#: Tightest of the caps, because the missing part was stated explicitly rather
+#: than inferred.
+UNIT_NOT_FOUND_CONFIDENCE_CAP = 0.65
+
+#: Ceiling when a street number was given and no row on that street carries it,
+#: so the answer fell back to the street centroid. Tighter than
+#: UNIT_NOT_FOUND, because there at least the building was found: here nothing
+#: below the street was.
+#:
+#: Without this a degraded answer reported full confidence. '14-40 Wills Street
+#: Melbourne VIC 3000' parses perfectly -- postcode, state, locality and street
+#: all corroborate, joint score 4.03 -- and then finds no row at number 14 and
+#: returns the street. The parse being excellent says nothing about an address
+#: that is not in G-NAF, and 1.000 on a street centroid invites a consumer to
+#: treat it as the address asked for.
+NUMBER_NOT_FOUND_CONFIDENCE_CAP = 0.60
+
+#: Ceiling when the matched row is a G-NAF alias. Mildest of the caps: the
+#: address is real, the coordinates are its own, and the only reservation is that
+#: G-NAF considers a different row canonical, which `canonical_pid` and
+#: `principal` already report.
+ALIAS_CONFIDENCE_CAP = 0.85
+
 
 def _tighter(current: float | None, cap: float) -> float:
     """The lower of two ceilings, so a second doubt can only narrow the first."""
@@ -530,6 +557,7 @@ def lookup(
             f"no G-NAF row for number {number_first} on "
             f"{street.street_key} in {street.row.locality}; fell back to the street"
         )
+        cap = _tighter(cap, NUMBER_NOT_FOUND_CONFIDENCE_CAP)
         return _result(Granularity.STREET, s_lat, s_lng, None, warnings, hypothesis, trips, cap)
 
     if unit:
@@ -539,6 +567,8 @@ def lookup(
                 hit, counted_principal(principal, trips, "row_by_pid")
             )
             warnings.extend(alias_warnings)
+            if hit.is_alias:
+                cap = _tighter(cap, ALIAS_CONFIDENCE_CAP)
             return _result(
                 Granularity.UNIT,
                 hit.lat,
@@ -555,6 +585,7 @@ def lookup(
         warnings.append(
             f"unit {unit} not found at {number_first} {street.street_key}; returned the building"
         )
+        cap = _tighter(cap, UNIT_NOT_FOUND_CONFIDENCE_CAP)
 
     chosen, exact = match_range(rows, number_last)
     if number_last and not exact:
@@ -578,6 +609,8 @@ def lookup(
         chosen, counted_principal(principal, trips, "row_by_pid")
     )
     warnings.extend(alias_warnings)
+    if chosen.is_alias:
+        cap = _tighter(cap, ALIAS_CONFIDENCE_CAP)
     return _result(
         Granularity.ADDRESS,
         chosen.lat,
