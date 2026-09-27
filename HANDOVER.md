@@ -194,7 +194,9 @@ One normalize() function. `locatron/normalize.py` is the only place
 normalisation happens. Never reimplement it in SQL — build scripts leave
 `norm_key` NULL and `scripts/normalize_pass.py` fills them by importing the same
 function the resolver calls. Changing it requires bumping `NORM_VERSION`,
-rerunning the normalize pass with `--all`, and flushing Redis. Build-time and
+rerunning the normalize pass with `--all`. (There is no resolve cache yet, so
+there is nothing to flush; see the Architecture section of CLAUDE.md for the
+rule that applies when one is added.) Build-time and
 query-time normalisation drifting apart produces silent misses that look like
 bad data rather than a bug.
 ---

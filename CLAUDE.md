@@ -40,10 +40,9 @@ place normalisation happens.
 - Never reimplement normalisation in SQL. SQL build scripts leave `norm_key`
   columns NULL; `scripts/normalize_pass.py` fills them by importing the same
   function the resolver calls.
-- `NORM_VERSION` is baked into every Redis cache key and stored on every derived
-  table row.
-- Changing `normalize()` requires bumping `NORM_VERSION`, rerunning the
-  normalize pass with `--all`, and flushing the Redis cache.
+- `NORM_VERSION` is stored on every derived table row.
+- Changing `normalize()` requires bumping `NORM_VERSION` and rerunning the
+  normalize pass with `--all`.
 
 Build-time and query-time normalisation drifting apart produces silent misses
 that look like bad data rather than a bug. This is the single most important
@@ -139,8 +138,19 @@ Single Proxmox LXC. Low container count is a deliberate constraint.
 - `locatron-api` on :8080 — interactive resolve. Latency-sensitive.
 - `locatron-bulk` on :8081 — exports and batch. Separate process so a large
   export cannot starve interactive traffic.
-- `redis` on localhost — result cache only. Losing it must cost latency, never
-  correctness.
+- `redis` on localhost — intended as a result cache only, and **not built yet**.
+  There is no `cache.py`, nothing imports redis, and nothing has ever been
+  written to it: the settings in `config.py`, the `LOCATRON_REDIS_URL` in
+  `.env.example` and `MatchMethod.CACHE` are all placeholders for it. So there
+  are no cached answers to invalidate, and nothing to flush when `NORM_VERSION`
+  changes.
+
+  When a cache is added, two rules come with it. Losing it must cost latency,
+  never correctness. And its key must include **both** `NORM_VERSION` and a
+  `PARSER_VERSION`, so that changing normalisation *or* changing parsing,
+  routing or scoring invalidates stale answers on deploy rather than needing a
+  manual flush somebody will forget. An input's answer depends on both, and only
+  one of them is currently versioned at all.
 - Local SQLite at `config.sqlite_path` — the street gazetteer mirror, 532k rows
   and about 55 MB, shared across workers via the OS page cache. Built by
   `locatron build streets`; opened read-only, once per worker, in

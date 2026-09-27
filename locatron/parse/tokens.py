@@ -63,6 +63,17 @@ class Span:
         """
         return self.start < other.end and other.start < self.end
 
+    def within(self, other: Span) -> bool:
+        """Whether every token this span claims is also claimed by `other`.
+
+        Distinct from `overlaps`, and the distinction decides routing. A fuzzy
+        locality whose span sits entirely inside the state token's span explains
+        nothing the state token did not: 'New South Wales' fuzzy-matches
+        SOUTH BOWENFELS over tokens the state name already accounts for, while
+        'Ku-ring-gai NSW' overlaps the state token but reaches a token beyond it.
+        """
+        return other.start <= self.start and self.end <= other.end
+
 
 @dataclass(frozen=True, slots=True)
 class Token:

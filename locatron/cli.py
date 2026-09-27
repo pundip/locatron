@@ -327,7 +327,9 @@ def golden(
     failures: list[tuple[str, str]] = []
 
     for row in rows:
-        got = resolve_one(row["input"])
+        # Synthetic input, so it stays out of locatron_unresolved: the point of
+        # that table is real traffic worth promoting into an alias.
+        got = resolve_one(row["input"], record_unresolved=False)
         why = _golden_mismatch(row, got)
         if why is None:
             passed += 1
@@ -368,50 +370,6 @@ _SIGNAL_ORDER = (
     "street_type_mismatch",
     "unexplained_tokens",
 )
-
-
-def _extract_components(ts, known_postcodes):
-    """Run Prompt A's extractors and decide which token plays which role.
-
-    This arbitration is not in the package yet: the pipeline that will own it is
-    a later prompt, and until then it lives here and in the parse tests. Two
-    rules, both load-bearing:
-
-    A four-digit postcode token is not also offered as a street number, because
-    it is a postcode far more often than a house number. A padded three-digit one
-    is left available for both, because '810 Stuart Highway Winnellie' means a
-    house number even though 0810 is a real postcode.
-    """
-    from locatron.parse.components import (
-        find_po_boxes,
-        find_postcodes,
-        find_street_numbers,
-        find_units_and_levels,
-    )
-
-    boxes = find_po_boxes(ts)
-    units = find_units_and_levels(ts)
-    postcodes = find_postcodes(ts, known_postcodes)
-
-    claimed = [b.span for b in boxes] + [u.span for u in units]
-    four_digit_starts = {c.span.start for c in postcodes if not c.padded}
-
-    # '5/12' is one token carrying a unit and a street number at once, which is
-    # the whole point of the form. The unit has already claimed that token, so
-    # without this the slash form reported no number at all while the spelled
-    # form 'UNIT 5 12' reported 12. Both now report unit=5, number=12.
-    slash_spans = {u.span for u in units if u.street_number_hint}
-
-    numbers = [
-        n
-        for n in find_street_numbers(ts)
-        if n.span.start not in four_digit_starts
-        and (
-            not any(n.span.overlaps(s) for s in claimed) or (n.from_slash and n.span in slash_spans)
-        )
-    ]
-    claimed += [n.span for n in numbers]
-    return boxes, units, postcodes, numbers, claimed
 
 
 def _lookup_lines(top, units, numbers, boxes) -> list[str]:
@@ -542,13 +500,25 @@ def _token_roles(ts, winner, boxes, units, postcodes, numbers) -> list[str]:
 
 
 def _parse_one(text_in: str, au, known_postcodes) -> list[str]:
-    """One input's report, as lines. Pure formatting over the parser stages."""
+    """One input's report, as lines. Pure formatting over the parser stages.
+
+    Runs the same `extract_components` the resolver does rather than a copy of it,
+    so a report that says the number is 12 means the served answer used 12.
+    """
     from locatron.parse.locality import generate_hypotheses
     from locatron.parse.street import resolve_streets
     from locatron.parse.tokens import tokenize
+    from locatron.resolve.au import extract_components
 
     ts = tokenize(text_in)
-    boxes, units, postcodes, numbers, claimed = _extract_components(ts, known_postcodes)
+    parts = extract_components(ts, known_postcodes)
+    boxes, units, postcodes, numbers, claimed = (
+        parts.boxes,
+        parts.units,
+        parts.postcodes,
+        parts.numbers,
+        parts.claimed,
+    )
 
     out = [f"input      {text_in!r}", f"tokens     {list(ts.texts)}"]
 

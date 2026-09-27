@@ -16,7 +16,7 @@ from locatron.config import Settings, get_settings
 from locatron.db import mysql
 from locatron.gazetteer.au import load_au
 from locatron.gazetteer.countries import load_countries
-from locatron.resolve import scoring
+from locatron.resolve import scoring, world
 from locatron.resolve.pipeline import resolve_one
 from locatron.resolve.scoring import MatchKind, ScoreParts
 from locatron.resolve.world import extract_evidence
@@ -496,11 +496,18 @@ def test_confidence_stays_below_the_gazetteer_ceiling() -> None:
 
     Reporting 1.0 for a locality lookup claims certainty this layer cannot have;
     above the ceiling belongs to an exact G-NAF address match.
+
+    Asserted against `world.resolve_place` rather than `resolve_one`, because an
+    input of this shape -- a postcode and a state token -- now routes to the AU
+    path, which calibrates its own confidence. The ceiling is still this layer's
+    invariant; there is simply no longer an input that reaches it through the
+    pipeline.
     """
     s = get_settings()
-    got = resolve_one("Ryde NSW 2112")
-    assert got.confidence == pytest.approx(s.score_max)
-    assert got.confidence < 1.0
+    winner, _candidates, _warnings, _normalized = world.resolve_place("Ryde NSW 2112")
+    assert winner is not None
+    assert min(1.0, max(0.0, winner.score)) == pytest.approx(s.score_max)
+    assert winner.score >= s.score_max, "it saturated rather than landing there"
 
 
 @needs_db

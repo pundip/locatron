@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     cache_ttl_negative_seconds: int = 7 * 24 * 3600
     cache_enabled: bool = True
 
+    #: Whether a thin answer is recorded in `locatron_unresolved`. On by default:
+    #: reviewing that table by hit_count and promoting real entries into
+    #: locatron_locality_alias is what makes the resolver better over time. Turn
+    #: it off for a bulk backfill of synthetic input, which would bury the real
+    #: traffic it is meant to surface.
+    log_unresolved: bool = True
+
     data_dir: str = "/var/lib/locatron"
     sqlite_path: str = "/opt/locatron/data/gazetteer.sqlite"
 

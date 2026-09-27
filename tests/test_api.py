@@ -455,3 +455,64 @@ def test_e2e_batch(client: AsgiClient) -> None:
     assert body["results"][0]["country"]["alpha3"] == "AUS"
     assert body["results"][1]["country"]["alpha3"] == "USA"
     assert body["results"][2]["granularity"] == "unresolved"
+
+
+def _mirror_available() -> bool:
+    try:
+        from locatron.db import local
+
+        local.read_meta()
+        return True
+    except Exception:
+        return False
+
+
+needs_stores = pytest.mark.skipif(
+    not (_db_available() and _mirror_available()),
+    reason="needs ReferenceDB and a built street mirror",
+)
+
+
+@needs_stores
+def test_e2e_batch_mixes_au_addresses_and_world_places(client: AsgiClient) -> None:
+    """One request, both paths. A bulk consumer sends whatever the scrape held and
+    should not have to sort Australian addresses from place names first.
+    """
+    items = [
+        "65 Clifton Park Dr Carrum Downs VIC 3201",  # AU, full address
+        "Las Vegas",  # world, city
+        "Carrum Downs VIC",  # AU, locality
+        "Delhi",  # world, population tiebreak
+        "3201",  # AU, bare postcode
+        "qwxzv zzqq plorb",  # neither
+    ]
+    r = client.post("/v1/resolve/batch", json={"items": items})
+    assert r.status == 200
+    body = r.json()
+    assert body["count"] == len(items)
+    assert [x["query"] for x in body["results"]] == items, "order is preserved"
+
+    got = [x["granularity"] for x in body["results"]]
+    assert got == ["address", "city", "locality", "city", "postcode", "unresolved"]
+
+    # The AU rows carry a G-NAF record; the world rows carry none, in the same
+    # envelope, so a consumer never branches on which resolver ran.
+    address, vegas = body["results"][0], body["results"][1]
+    assert address["au_address"]["formatted"] == "65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201"
+    assert address["canonical_pid"]
+    assert vegas["au_address"] is None
+    assert vegas["canonical_pid"] is None
+    assert body["results"][4]["locality"] is None, "a bare postcode names no locality"
+
+
+@needs_stores
+def test_e2e_an_au_address_serialises_every_gnaf_field(client: AsgiClient) -> None:
+    r = client.get("/v1/resolve", params={"text": "12 Alice Street Amaroo ACT 2914"})
+    assert r.status == 200
+    body = r.json()
+    assert body["granularity"] == "address"
+    assert body["au_address"]["geocode_type"]
+    assert body["au_address"]["date_created"]
+    assert body["principal"]["formatted"] == "49 ROLLSTON ST, AMAROO ACT 2914"
+    assert body["canonical_pid"] == body["principal"]["pid"]
+    assert any("alias" in w for w in body["warnings"])
