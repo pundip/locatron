@@ -82,7 +82,16 @@ class Geo(BaseModel):
 
 
 class AuAddress(BaseModel):
-    """G-NAF fields. Populated only for granularity unit/address/street."""
+    """Every G-NAF column from the matched `address_ref` row.
+
+    Populated for granularity unit and address, where a row was actually
+    matched. Empty for street and below: those answers come from precomputed
+    centroids and there is no single row behind them.
+
+    Blank strings from G-NAF arrive here as None, because a consumer checking
+    `if flat_number` should not have to know that address_ref uses '' for
+    absent.
+    """
 
     address_detail_pid: str | None = None
     flat_type: str | None = None
@@ -91,25 +100,56 @@ class AuAddress(BaseModel):
     level_number: str | None = None
     number_first: str | None = None
     number_last: str | None = None
+    lot_number: str | None = None
     street_name: str | None = None
     street_type: str | None = None
     street_suffix: str | None = None
     locality_name: str | None = None
     state: str | None = None
     postcode: str | None = None
+    building_name: str | None = None
+    address_site_name: str | None = None
     mb_code: str | None = None
-    alias_principal: str | None = None
-    primary_secondary: str | None = None
+    legal_parcel_id: str | None = None
+    geocode_type: str | None = Field(
+        None, description="How G-NAF sited the point, e.g. 'PROPERTY CENTROID'"
+    )
+    alias_principal: str | None = Field(
+        None, description="'P' for a principal row, 'A' for an alias of one"
+    )
+    principal_pid: str | None = Field(
+        None, description="Set on an alias row: the pid it is an alias of"
+    )
+    primary_secondary: str | None = Field(
+        None, description="'P' group head, 'S' member, None for an ordinary address"
+    )
+    primary_pid: str | None = None
+    date_created: str | None = None
     formatted: str | None = Field(
         None,
-        description=(
-            "Single-line canonical form, e.g. '65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201'"
-        ),
+        description=("G-NAF's own ADDRESS_LABEL, e.g. '65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201'"),
     )
 
 
+class Principal(BaseModel):
+    """The principal address an alias match belongs to.
+
+    Set only when the matched row is a G-NAF alias. The match itself stays the
+    alias -- it carries the street and number the input used -- and this is the
+    row to join and deduplicate on. See `canonical_pid`.
+    """
+
+    pid: str
+    formatted: str = Field(description="The principal's own ADDRESS_LABEL")
+
+
 class Candidate(BaseModel):
-    """A runner-up. Populated when the match was ambiguous."""
+    """A runner-up. Populated when the match was ambiguous.
+
+    For a bare postcode this is where the localities it could mean go: the input
+    proved the postcode and nothing narrower, so they are alternates rather than
+    an answer.
+    """
 
     label: str
     confidence: float
@@ -117,6 +157,14 @@ class Candidate(BaseModel):
     country: str | None = None
     admin1: str | None = None
     locality: str | None = None
+    postcode: str | None = None
+    score: float | None = Field(
+        None,
+        description=(
+            "The raw joint score, before mapping onto 0..1. Exposed so a caller "
+            "can see the margin over the winner, which confidence only summarises."
+        ),
+    )
     reason: str | None = None
 
 
@@ -144,6 +192,15 @@ class ResolveResponse(BaseModel):
     postcode: str | None = None
     geo: Geo | None = None
     au_address: AuAddress | None = None
+    canonical_pid: str | None = Field(
+        None,
+        description=(
+            "The G-NAF pid to join and deduplicate on: the principal's pid when "
+            "the match is an alias, the matched row's own pid otherwise. None "
+            "below address granularity, where no single row was matched."
+        ),
+    )
+    principal: Principal | None = None
 
     candidates: list[Candidate] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

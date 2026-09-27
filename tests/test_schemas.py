@@ -100,3 +100,59 @@ def test_confidence_is_bounded() -> None:
                 match_method=MatchMethod.CITY_EXACT,
                 norm_version="1",
             )
+
+
+# ---------------------------------------------------------------------------
+# the G-NAF envelope
+# ---------------------------------------------------------------------------
+
+
+def test_au_address_exposes_every_gnaf_column() -> None:
+    """The point of `au_address` is that a consumer never has to go back to
+    address_ref for a column we did not think to forward. An upstream refresh
+    that adds one must fail here rather than quietly drop it.
+
+    `formatted` is ADDRESS_LABEL renamed; lat/lng live in `geo`.
+    """
+    from locatron.parse.lookup import GnafRecord
+    from locatron.schemas import AuAddress
+
+    columns = set(GnafRecord.__dataclass_fields__) - {"lat", "lng", "address_label"}
+    exposed = set(AuAddress.model_fields) - {"formatted"}
+    assert columns - exposed == set(), "G-NAF columns missing from the response"
+    assert exposed - columns == set(), "response fields with no G-NAF column behind them"
+
+
+def test_the_envelope_carries_a_canonical_pid_and_a_principal() -> None:
+    from locatron.schemas import Principal
+
+    r = ResolveResponse(
+        query="12 Alice Street Amaroo ACT 2914",
+        normalized="12 ALICE STREET AMAROO ACT 2914",
+        resolved=True,
+        granularity=Granularity.ADDRESS,
+        confidence=0.7,
+        match_method=MatchMethod.GNAF_EXACT,
+        canonical_pid="GAACT714849931",
+        principal=Principal(pid="GAACT714849931", formatted="49 ROLLSTON ST, AMAROO ACT 2914"),
+        norm_version="1",
+    )
+    assert r.canonical_pid == "GAACT714849931"
+    assert r.principal is not None and r.principal.pid == "GAACT714849931"
+
+
+def test_the_new_fields_are_optional_so_world_responses_are_unchanged() -> None:
+    """Additive means a world-path response built the old way still validates and
+    still serialises the same keys it did before, plus nulls."""
+    r = ResolveResponse(
+        query="Delhi",
+        normalized="DELHI",
+        resolved=True,
+        granularity=Granularity.CITY,
+        confidence=0.9,
+        match_method=MatchMethod.CITY_POPULATION_TIEBREAK,
+        norm_version="1",
+    )
+    assert r.canonical_pid is None
+    assert r.principal is None
+    assert r.au_address is None
