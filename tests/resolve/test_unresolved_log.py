@@ -12,6 +12,10 @@ import pytest
 from locatron.resolve import unresolved as log
 from locatron.schemas import Granularity, MatchMethod, ResolveResponse
 
+#: This module tests `record()` itself, so it opts out of conftest's fake. MySQL
+#: is still made unreachable from inside it, so no row can be written.
+pytestmark = pytest.mark.real_unresolved_log
+
 
 def _response(
     granularity: Granularity,
@@ -86,7 +90,7 @@ def test_an_empty_key_is_not_recorded(monkeypatch) -> None:
         called = True
         raise AssertionError("should not reach the database")
 
-    monkeypatch.setattr(log.mysql, "get_engine", fail)
+    monkeypatch.setattr(log, "_engine", fail)
     assert log.record(_response(Granularity.UNRESOLVED, normalized="   ")) is False
     assert called is False
 
@@ -100,7 +104,7 @@ def test_a_database_failure_is_swallowed_and_logged(monkeypatch, caplog) -> None
     def explode():
         raise RuntimeError("connection refused")
 
-    monkeypatch.setattr(log.mysql, "get_engine", explode)
+    monkeypatch.setattr(log, "_engine", explode)
     assert log.record(_response(Granularity.UNRESOLVED)) is False
 
 
@@ -145,3 +149,22 @@ def test_long_values_are_truncated_rather_than_rejected() -> None:
     """A 4KB scraped string is exactly the kind of input worth recording, and the
     columns are varchar(255)."""
     assert log._MAX_LEN == 255
+
+
+# ---------------------------------------------------------------------------
+# the test-suite guard itself
+# ---------------------------------------------------------------------------
+
+
+def test_the_write_seam_is_the_only_way_to_reach_mysql() -> None:
+    """`record()` must go through `_engine()` and nothing else.
+
+    That indirection is what lets conftest make writing impossible per test
+    without patching the shared `mysql` module, which every read depends on. A
+    direct `mysql.get_engine()` call inside record() would slip past the guard.
+    """
+    import inspect
+
+    body = inspect.getsource(log.record)
+    assert "_engine()" in body
+    assert "mysql.get_engine" not in body

@@ -516,3 +516,20 @@ def test_e2e_an_au_address_serialises_every_gnaf_field(client: AsgiClient) -> No
     assert body["principal"]["formatted"] == "49 ROLLSTON ST, AMAROO ACT 2914"
     assert body["canonical_pid"] == body["principal"]["pid"]
     assert any("alias" in w for w in body["warnings"])
+
+
+@needs_db
+def test_the_api_never_writes_to_the_feedback_table(
+    client: AsgiClient, unresolved_writes: list
+) -> None:
+    """The API reaches the resolver through an endpoint and cannot pass
+    `record_unresolved=False`, so these requests are exactly the ones that would
+    have filed synthetic rows into locatron_unresolved. conftest's autouse guard is
+    what stops them, and this asserts the guard is doing it rather than the write
+    simply not being attempted.
+    """
+    r = client.get("/v1/resolve", params={"text": "qwxzv zzqq plorb"})
+    assert r.status == 200
+    assert r.json()["granularity"] == "unresolved"
+    # The resolver did try to log it -- caught by the fake, not by MySQL.
+    assert [x.query for x in unresolved_writes] == ["qwxzv zzqq plorb"]

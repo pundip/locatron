@@ -57,6 +57,18 @@ evaluates ON DUPLICATE KEY UPDATE left to right, and putting best_confidence
 first would make every comparison after it trivially false."""
 
 
+def _engine():
+    """The engine `record()` writes through.
+
+    A seam, so a test can make writing impossible without touching
+    `locatron.db.mysql`, which every read in the process shares. Patching that
+    module instead takes the gazetteer down with it, and a resolve that cannot
+    load its gazetteer fails long before it reaches the feedback log -- which is
+    exactly the confusing failure this indirection avoids.
+    """
+    return mysql.get_engine()
+
+
 def is_worth_recording(response: ResolveResponse, unexplained: tuple[str, ...] = ()) -> bool:
     """Whether this answer belongs in the feedback loop.
 
@@ -106,7 +118,7 @@ def record(
         "match_method": response.match_method.value,
     }
     try:
-        with mysql.get_engine().begin() as conn:
+        with _engine().begin() as conn:
             conn.execute(_UPSERT, params)
     except Exception as exc:  # noqa: BLE001 - rule 1: never fail the request
         log.warning(

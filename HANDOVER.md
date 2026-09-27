@@ -80,9 +80,27 @@ Rebuild order: street, then locality (it reads street counts), then
 `scripts/normalize_pass.py`. All `norm_key` columns are populated at
 NORM_VERSION 1.
 Three MySQL accounts, enforcing the read-only invariant at the grant level:
-`locatron_ro` (SELECT only, use this for inspection), `locatron` (the service,
-writes only to `locatron_unresolved` and `locatron_api_key`), `locatron_build`
-(gazetteer rebuilds, run by hand).
+`locatron_ro` (SELECT only, use this for inspection), `locatron` (the service),
+`locatron_build` (gazetteer rebuilds, run by hand). Scripts that need the build
+account get it by overriding `LOCATRON_MYSQL_USER` and `LOCATRON_MYSQL_PASSWORD`
+in the environment; there are no separate build settings.
+
+The service account's grants, verbatim from `SHOW GRANTS`, because the details
+matter and the earlier summary here was wrong:
+
+```
+GRANT SELECT ON `ReferenceDB`.* TO `locatron`@`%`
+GRANT INSERT, UPDATE ON `ReferenceDB`.`locatron_unresolved` TO `locatron`@`%`
+GRANT UPDATE ON `ReferenceDB`.`locatron_api_key` TO `locatron`@`%`
+```
+
+So on `locatron_unresolved` it has **INSERT and UPDATE but not DELETE**: the
+resolver can file a row and bump its `hit_count`, and nothing in the application
+can remove one. Clearing a row needs `locatron_build` or a DBA. That is the right
+shape for a feedback table, and it is also why no test may write to it — see
+`tests/conftest.py`, which blocks that for every test rather than relying on each
+call site to opt out. On `locatron_api_key` it has UPDATE only, not INSERT, so
+creating a key is a manual operation too.
 ---
 Phase 2: the AU address parser
 The remaining substantial work. Everything below is design already settled.
