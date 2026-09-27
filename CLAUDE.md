@@ -154,6 +154,68 @@ MySQL is external at `pundip.com:3335`, database `ReferenceDB`.
 Public URL is `urlloom.com/locatron`, so FastAPI apps use
 `root_path="/locatron"`.
 
+## Routing: which path resolves an input
+
+`resolve_one()` picks between the AU address path and the world place path. The
+world path is the default and the fallback; the AU path has to be earned.
+
+An input takes the AU path when **at least one trigger** fires and **the gate**
+holds.
+
+Triggers — each is something a loose world place string does not carry:
+
+| Trigger | Fires on |
+|---|---|
+| `postcode` | a postcode candidate that validates against `locatron_locality` |
+| `state` | a **strong** state token, i.e. `aus_state_bucket`'s `state_tokens`, never a `state_hint` |
+| `pobox` | a PO box was found |
+| `street+type` | a street match whose `reading` is `name+type`, so the input supplied a street-type word |
+| `number+street` | a street number and any street match |
+
+The two street triggers are narrow on purpose. A bare street match is **not** a
+trigger: `New York` matches street `NEW ST` in locality `YORK` at score 2.555
+with nothing unexplained, and routing it to the AU path would answer a New York
+query with a street in York, WA. What distinguishes a real Australian street is
+an explicit type word in the input (`Clifton Park **Drive** Carrum Downs`) or a
+number in front of it.
+
+Gate — all must hold:
+
+- a locality hypothesis exists at all. `VIC` alone fires the `state` trigger and
+  produces no hypothesis, so it stays on the world path and keeps `admin1`.
+- the winning joint score is not negative. A floor, not a tuning knob: a
+  negative score means the parse explains less than it fails to.
+- if the winning locality matched **fuzzy**, nothing is left unexplained.
+  `Victoria Australia` fires `state`, then fuzzy-matches locality `TORRITA` and
+  leaves `AUSTRALIA` unexplained — a state name being read as a suburb. It keeps
+  `admin1`. `Ku-ring-gai NSW` is also fuzzy, explains every token, and takes the
+  AU path. This replaces a score threshold, which would have needed a magic
+  number between 0.893 and 1.627 and nothing to justify it.
+
+`scripts/route_probe.py` prints the route and landing granularity for every
+golden row and probe case. Run it after touching the triggers, the gate or the
+mapping.
+
+### Granularity mapping
+
+The response vocabulary (`schemas.Granularity`) is fixed: `unit`, `address`,
+`street`, `postcode`, `locality`, `admin1`, `city`, `country`, `unresolved`. The
+parser ladder has its own five rungs, and they are not the same list.
+
+| Ladder rung | Response granularity | Why |
+|---|---|---|
+| `unit` | `unit` | |
+| `address` | `address` | |
+| `street` | `street` | |
+| `locality` | `locality` **or** `postcode` | `postcode` when the winning hypothesis's `locality_span` is empty |
+| `postal` | `postcode` | G-NAF holds no PO boxes, so the postcode is the finest truth available. There is no `postal` member and adding one would break consumers. |
+
+The `locality`/`postcode` split is exact, not a heuristic. A candidate that came
+from `candidates_for_postcode()` carries `Span(0, 0)`, because the input never
+named the locality — only the postcode, which can span several localities. So
+`3201` answers `postcode` with `VIC`, and the localities it could mean go in
+`candidates`. `Carrum Downs VIC` names its locality and answers `locality`.
+
 ## Technical decisions
 
 - **Synchronous SQLAlchemy with `def` endpoints**, not `async def`. FastAPI runs
