@@ -27,7 +27,7 @@ from locatron.normalize import NORM_VERSION, normalize
 from locatron.resolve import au as au_path
 from locatron.resolve import unresolved as unresolved_log
 from locatron.resolve import world
-from locatron.schemas import Granularity, MatchMethod, ResolveResponse
+from locatron.schemas import Granularity, MatchMethod, ResolveResponse, Route
 
 
 def unresolved(
@@ -149,6 +149,7 @@ def _au_response(
         granularity=answer.granularity,
         confidence=answer.confidence,
         match_method=answer.match_method,
+        route=Route.AU,
         country=country.to_schema() if country else None,
         admin1=answer.admin1,
         locality=answer.locality,
@@ -181,12 +182,14 @@ def _world_response(
         include_candidates=include_candidates,
     )
     if winner is None:
-        return unresolved(
+        floor = unresolved(
             text,
             normalized=normalized,
             warnings=[*warnings, *world_warnings],
             elapsed_ms=elapsed(),
         )
+        # The world resolver did run and did conclude; it concluded nothing.
+        return floor.model_copy(update={"route": Route.WORLD})
     return ResolveResponse(
         query=text,
         normalized=normalized,
@@ -194,6 +197,7 @@ def _world_response(
         granularity=winner.granularity,
         confidence=round(min(1.0, max(0.0, winner.score)), 4),
         match_method=winner.match_method,
+        route=Route.WORLD,
         country=world.to_country_schema(winner.country),
         admin1=world.to_admin1_schema(winner),
         locality=winner.locality,

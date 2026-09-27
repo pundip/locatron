@@ -29,7 +29,7 @@ from sqlalchemy import text
 from locatron.config import env_files, get_settings
 from locatron.db import mysql
 from locatron.normalize import NORM_VERSION, normalize, strip_qualifiers
-from locatron.schemas import ResolveResponse
+from locatron.schemas import Granularity, ResolveResponse
 
 app = typer.Typer(add_completion=False, help="Locatron CLI")
 
@@ -262,14 +262,108 @@ def norm(text_in: str) -> None:
     typer.echo(f"stripped   {strip_qualifiers(n)!r}")
 
 
+def _display(r: ResolveResponse) -> str:
+    """One human-readable line for the answer, whichever path produced it.
+
+    The column a person actually reads when scanning a few thousand rows, so it is
+    the most specific thing available rather than a fixed format: G-NAF's own label
+    for an address, and a locality, city or country line otherwise.
+    """
+    if r.au_address is not None and r.au_address.formatted:
+        return r.au_address.formatted
+
+    admin1 = (r.admin1.code or r.admin1.name) if r.admin1 else None
+    country = r.country.alpha3 if r.country else None
+
+    # A city answer names no locality -- the envelope has no field for the matched
+    # city's name -- so the query itself is what identifies the place. Without this
+    # 'Greater Melbourne' rendered as 'VIC AUS'.
+    lead = r.locality or (r.query.strip() if r.granularity is Granularity.CITY else None)
+    if lead and admin1 and admin1.casefold() == lead.casefold():
+        admin1 = None  # 'Delhi Delhi IND' says nothing twice.
+
+    parts = [p for p in (lead, admin1, r.postcode, country) if p]
+    return " ".join(parts)
+
+
+def _resolve_file(
+    in_path: Path, out_path: Path, *, country_bias: str | None, progress_every: int = 500
+) -> int:
+    """Resolve one input per line into a CSV. Returns the row count.
+
+    Gazetteers load once, on the first call, and the street mirror is opened once
+    -- so a 100k-line file costs one warm-up rather than 100k. Blank lines are
+    skipped; nothing else is, because an input that resolves to nothing is a row
+    worth having in the output.
+    """
+    from locatron.resolve.pipeline import resolve_one
+
+    written = 0
+    with (
+        in_path.open(encoding="utf-8") as src,
+        out_path.open("w", newline="", encoding="utf-8") as dst,
+    ):
+        writer = csv.writer(dst)
+        writer.writerow(["input", "route", "granularity", "confidence", "display", "warnings"])
+        for line in src:
+            text_in = line.strip()
+            if not text_in:
+                continue
+            r = resolve_one(text_in, country_bias=country_bias)
+            writer.writerow(
+                [
+                    text_in,
+                    r.route.value if r.route else "",
+                    r.granularity.value,
+                    f"{r.confidence:.4f}",
+                    _display(r),
+                    # One cell, so a spreadsheet keeps the row intact. csv quotes it.
+                    " | ".join(r.warnings),
+                ]
+            )
+            written += 1
+            if progress_every and written % progress_every == 0:
+                typer.echo(f"  {written} rows...", err=True)
+    return written
+
+
 @app.command()
 def resolve(
-    text_in: str,
+    text_in: str = typer.Argument(None, help="One string to resolve. Omit when using --file."),
     country_bias: str = typer.Option(None, "--bias"),
     candidates: bool = typer.Option(False, "--candidates"),
+    in_file: Path = typer.Option(  # noqa: B008 - typer reads the default
+        None, "--file", help="Resolve one input per line from this file instead."
+    ),
+    out_file: Path = typer.Option(  # noqa: B008 - typer reads the default
+        None, "--out", help="Write the results here as CSV."
+    ),
 ) -> None:
-    """Resolve a single string."""
+    """Resolve a single string, or a whole file with --file and --out.
+
+    The file form writes columns input, route, granularity, confidence, display and
+    warnings, loading the gazetteers once for the whole run. It is how a batch of
+    real scraped strings gets reviewed before anything is promoted into
+    locatron_locality_alias.
+    """
     from locatron.resolve.pipeline import resolve_one
+
+    if in_file is not None:
+        if text_in is not None:
+            raise typer.BadParameter("pass either a string or --file, not both")
+        if out_file is None:
+            raise typer.BadParameter("--file needs --out")
+        if not in_file.is_file():
+            raise typer.BadParameter(f"no such file: {in_file}")
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+        rows = _resolve_file(in_file, out_file, country_bias=country_bias)
+        typer.echo(f"{rows} rows -> {out_file}")
+        return
+
+    if text_in is None:
+        raise typer.BadParameter("give a string to resolve, or --file with --out")
+    if out_file is not None:
+        raise typer.BadParameter("--out only applies with --file")
 
     result = resolve_one(text_in, country_bias=country_bias, include_candidates=candidates)
     typer.echo(json.dumps(result.model_dump(mode="json"), indent=2, default=str))

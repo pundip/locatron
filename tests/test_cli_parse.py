@@ -288,3 +288,116 @@ def test_a_range_whose_first_number_does_not_exist_degrades_to_street() -> None:
     assert _roles(out)["14-40"] == "number 14-40"
     assert "granularity  street" in out
     assert "no G-NAF row for number 14" in out
+
+
+# ---------------------------------------------------------------------------
+# locatron resolve --file
+# ---------------------------------------------------------------------------
+
+
+@needs_stores
+def test_resolve_file_writes_one_csv_row_per_input(tmp_path) -> None:
+    """The batch review form: a file of real scraped strings in, a CSV out. Mixes
+    both paths, because a scrape does."""
+    import csv
+
+    src = tmp_path / "in.txt"
+    src.write_text(
+        "\n".join(
+            [
+                "65 Clifton Park Dr Carrum Downs VIC 3201",  # AU address
+                "",  # blank lines are skipped
+                "Delhi",  # world city
+                "3201",  # AU bare postcode
+                "   ",  # whitespace too
+                "asdfghjkl",  # resolves to nothing, still a row
+            ]
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.csv"
+    result = runner.invoke(app, ["resolve", "--file", str(src), "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert "4 rows" in result.output
+
+    rows = list(csv.DictReader(out.open(newline="", encoding="utf-8")))
+    assert [r["input"] for r in rows] == [
+        "65 Clifton Park Dr Carrum Downs VIC 3201",
+        "Delhi",
+        "3201",
+        "asdfghjkl",
+    ]
+    assert list(rows[0]) == [
+        "input",
+        "route",
+        "granularity",
+        "confidence",
+        "display",
+        "warnings",
+    ]
+    assert [r["route"] for r in rows] == ["au", "world", "au", "world"]
+    assert [r["granularity"] for r in rows] == ["address", "city", "postcode", "unresolved"]
+    assert rows[0]["display"] == "65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201"
+    assert 0.0 <= float(rows[3]["confidence"]) <= 1.0
+
+
+@needs_stores
+def test_resolve_file_puts_every_warning_in_one_cell(tmp_path) -> None:
+    """A degraded row has to stay one row: warnings are joined rather than spilling
+    into columns a spreadsheet would misread."""
+    import csv
+
+    src = tmp_path / "in.txt"
+    src.write_text("14-40 Wills Street Melbourne VIC 3000\n", encoding="utf-8")
+    out = tmp_path / "out.csv"
+    assert runner.invoke(app, ["resolve", "--file", str(src), "--out", str(out)]).exit_code == 0
+
+    (row,) = list(csv.DictReader(out.open(newline="", encoding="utf-8")))
+    assert row["granularity"] == "street"
+    assert "no G-NAF row for number 14" in row["warnings"]
+    assert float(row["confidence"]) <= 0.60, "the cap has to show up in the CSV"
+
+
+@needs_stores
+def test_resolve_file_loads_the_gazetteer_once(tmp_path) -> None:
+    """Asserted through the loader's own cache rather than by timing. A 100k-line
+    file must cost one warm-up, not 100k."""
+    from locatron.gazetteer.au import load_au
+
+    src = tmp_path / "in.txt"
+    src.write_text("\n".join(["Carrum Downs VIC"] * 20), encoding="utf-8")
+    out = tmp_path / "out.csv"
+
+    load_au.cache_clear()  # type: ignore[attr-defined]
+    assert load_au.is_loaded() is False  # type: ignore[attr-defined]
+    assert runner.invoke(app, ["resolve", "--file", str(src), "--out", str(out)]).exit_code == 0
+    assert load_au.is_loaded() is True  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["resolve"], "give a string to resolve"),
+        (["resolve", "Delhi", "--out", "x.csv"], "--out only applies with --file"),
+    ],
+)
+def test_resolve_rejects_an_incoherent_invocation(args: list[str], message: str) -> None:
+    result = runner.invoke(app, args)
+    assert result.exit_code != 0
+    assert message in result.output
+
+
+def test_resolve_file_needs_out(tmp_path) -> None:
+    src = tmp_path / "in.txt"
+    src.write_text("Delhi\n", encoding="utf-8")
+    result = runner.invoke(app, ["resolve", "--file", str(src)])
+    assert result.exit_code != 0
+    assert "--file needs --out" in result.output
+
+
+def test_resolve_file_rejects_a_missing_file(tmp_path) -> None:
+    result = runner.invoke(
+        app, ["resolve", "--file", str(tmp_path / "nope.txt"), "--out", str(tmp_path / "o.csv")]
+    )
+    assert result.exit_code != 0
+    assert "no such file" in result.output

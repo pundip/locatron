@@ -187,6 +187,15 @@ class ResolveRequest(BaseModel):
     use_cache: bool = True
 
 
+class Route(StrEnum):
+    """Which resolver answered."""
+
+    AU = "au"
+    """The Australian address path: parsed into locality, street, number, unit."""
+    WORLD = "world"
+    """The loose place path: matched against cities, countries and buckets."""
+
+
 class ResolveResponse(BaseModel):
     query: str
     normalized: str
@@ -194,6 +203,14 @@ class ResolveResponse(BaseModel):
     granularity: Granularity
     confidence: float = Field(ge=0.0, le=1.0)
     match_method: MatchMethod
+    route: Route | None = Field(
+        None,
+        description=(
+            "Which resolver produced this answer. None for an empty input or an "
+            "internal failure, where routing never happened. `match_method` cannot "
+            "stand in for it: both paths use locality_exact and postal_only."
+        ),
+    )
 
     country: Country | None = None
     admin1: Admin1 | None = None
