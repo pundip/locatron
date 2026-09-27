@@ -73,6 +73,21 @@ AU_CASES = [
     "810 Stuart Highway Winnellie",
     "200",
     "123",
+    # G-NAF lookup shapes, every one taken from the data rather than invented.
+    # Alpha suffix. G-NAF keeps it inside NUMBER_FIRST, so '59B' is one value
+    # there with NUMBER_LAST blank. Expect address granularity, number 59B.
+    "59B Moynihan Street Evatt ACT 2617",
+    # The building exists, the flat does not. 1 SMITH ST FITZROY carries flats
+    # 1 to 6, so unit 9 cannot match. Expect the building at address
+    # granularity with a warning, not a failure.
+    "Unit 9 1 Smith Street Fitzroy VIC 3065",
+    # Reachable only through an alias street name. ALICE ST is an
+    # ALIAS_PRINCIPAL='A' row pointing at 49 ROLLSTON ST. Expect the principal
+    # record, a warning naming the alias, and the only two-round-trip case.
+    "12 Alice Street Amaroo ACT 2914",
+    # A range with no exact range row. WILLS ST has 17-23 but no 17-99, so the
+    # first half alone answers. Expect 17-23 with a warning saying so.
+    "17-99 Wills Street Melbourne VIC 3000",
 ]
 
 LIVE_CASES = [
