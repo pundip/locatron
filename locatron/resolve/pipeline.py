@@ -21,13 +21,35 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime
+from functools import lru_cache
 
 from locatron.config import get_settings
+from locatron.db import local
 from locatron.normalize import NORM_VERSION, normalize
 from locatron.resolve import au as au_path
 from locatron.resolve import unresolved as unresolved_log
 from locatron.resolve import world
 from locatron.schemas import Granularity, MatchMethod, ResolveResponse, Route
+
+
+@lru_cache(maxsize=1)
+def snapshot_id() -> str | None:
+    """Which gazetteer build answered, for a consumer joining results to a load.
+
+    The same value `locatron check` prints: it comes from the street mirror's meta
+    table, which borrowed it from `locatron_locality` at build time. Read once
+    rather than per resolve -- the mirror is opened once per worker and a rebuild
+    only reaches the workers through a restart, so there is nothing for a longer
+    cache to go stale against.
+
+    None when there is no readable mirror. The world path does not need one, and a
+    missing snapshot id is not a reason to fail a resolve; a worker whose mirror is
+    missing has already refused to start.
+    """
+    try:
+        return local.read_meta().snapshot_id or None
+    except Exception:
+        return None
 
 
 def unresolved(
@@ -47,6 +69,7 @@ def unresolved(
         match_method=MatchMethod.NONE,
         warnings=warnings or [],
         norm_version=NORM_VERSION,
+        snapshot_id=snapshot_id(),
         elapsed_ms=elapsed_ms,
         resolved_at=datetime.now(UTC),
     )
@@ -161,6 +184,7 @@ def _au_response(
         candidates=answer.candidates,
         warnings=[*warnings, *answer.warnings],
         norm_version=NORM_VERSION,
+        snapshot_id=snapshot_id(),
         elapsed_ms=elapsed_ms,
         resolved_at=datetime.now(UTC),
     )
@@ -206,6 +230,7 @@ def _world_response(
         candidates=candidates,
         warnings=[*warnings, *world_warnings],
         norm_version=NORM_VERSION,
+        snapshot_id=snapshot_id(),
         elapsed_ms=elapsed(),
         resolved_at=datetime.now(UTC),
     )

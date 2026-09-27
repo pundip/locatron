@@ -477,3 +477,50 @@ def test_candidates_that_round_to_zero_confidence_are_dropped() -> None:
         "5/1 Smith Street Fitzroy VIC 3065", record_unresolved=False, include_candidates=True
     )
     assert all(c.confidence > 0.0 for c in r.candidates), [c.confidence for c in r.candidates]
+
+
+# ---------------------------------------------------------------------------
+# provenance
+# ---------------------------------------------------------------------------
+
+
+@needs_stores
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "65 Clifton Park Dr Carrum Downs VIC 3201",  # AU path
+        "Delhi",  # world path
+        "asdfghjkl",  # unresolved
+        "",  # the floor response
+    ],
+)
+def test_every_response_names_the_gazetteer_build_it_came_from(raw: str) -> None:
+    """snapshot_id was null on every resolve, so a Databricks table full of
+    answers had no way to say which gazetteer load produced them. It is on every
+    response, including the floor: a consumer joining on it wants every row, not
+    only the ones that resolved."""
+    from locatron.db import local
+
+    r = resolve_one(raw, record_unresolved=False)
+    assert r.snapshot_id == local.read_meta().snapshot_id
+    assert r.snapshot_id
+
+
+@needs_stores
+def test_a_missing_mirror_costs_the_snapshot_id_and_nothing_else(monkeypatch) -> None:
+    """The world path needs no mirror, and a missing snapshot id is not a reason
+    to fail a resolve. A worker whose mirror is missing has already refused to
+    start, so this only bites off the request path."""
+    from locatron.resolve import pipeline
+
+    def explode(*_a, **_k):
+        raise RuntimeError("no mirror here")
+
+    pipeline.snapshot_id.cache_clear()
+    monkeypatch.setattr(pipeline.local, "read_meta", explode)
+    try:
+        r = resolve_one("Delhi", record_unresolved=False)
+        assert r.snapshot_id is None
+        assert r.granularity is Granularity.CITY
+    finally:
+        pipeline.snapshot_id.cache_clear()
