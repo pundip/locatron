@@ -416,3 +416,64 @@ def test_the_fuzzy_sweep_runs_when_the_input_looks_like_an_address(raw: str) -> 
     one, a fuzzy locality could not route here anyway."""
     p = au_path.parse(raw)
     assert au_path.cheap_triggers(p.components) is True
+
+
+# ---------------------------------------------------------------------------
+# candidates describe themselves, not the winner
+# ---------------------------------------------------------------------------
+
+
+@needs_stores
+def test_a_candidate_reports_its_own_granularity() -> None:
+    """Runner-ups used to be stamped with the winner's level, so an alternate that
+    matched only a street was reported as `address` -- a claim that a row in
+    address_ref backed it, when nothing had been looked up at all."""
+    r = resolve_one(
+        "65 Clifton Park Dr Carrum Downs VIC 3201",
+        record_unresolved=False,
+        include_candidates=True,
+    )
+    assert r.granularity is Granularity.ADDRESS
+    assert r.candidates, "premise: there is a runner-up to describe"
+    for c in r.candidates:
+        assert c.granularity is not Granularity.ADDRESS
+        assert c.granularity is not Granularity.UNIT
+
+
+@needs_stores
+def test_a_candidate_never_claims_a_row_was_matched() -> None:
+    """address and unit mean a row was found in address_ref. A candidate is never
+    looked up, so neither level can honestly apply to one."""
+    for raw in [
+        "65 Clifton Park Dr Carrum Downs VIC 3201",
+        "5/1 Smith Street Fitzroy VIC 3065",
+        "2000",
+        "Ryde NSW 2112",
+    ]:
+        r = resolve_one(raw, record_unresolved=False, include_candidates=True)
+        assert all(
+            c.granularity in (Granularity.STREET, Granularity.LOCALITY, Granularity.POSTCODE)
+            for c in r.candidates
+        ), (raw, [c.granularity.value for c in r.candidates])
+
+
+@needs_stores
+def test_a_bare_postcode_offers_its_localities_at_postcode_level() -> None:
+    r = resolve_one("2000", record_unresolved=False, include_candidates=True)
+    assert r.candidates
+    assert all(c.granularity is Granularity.POSTCODE for c in r.candidates)
+    assert all(c.postcode == "2000" for c in r.candidates)
+
+
+@needs_stores
+def test_candidates_that_round_to_zero_confidence_are_dropped() -> None:
+    """An alternate the scoring has already ruled out is noise in a list whose job
+    is to show what was close. '5/1 Smith Street Fitzroy VIC 3065' has a runner-up
+    scoring well below zero."""
+    p = au_path.parse("5/1 Smith Street Fitzroy VIC 3065")
+    assert p.runner_up is not None and p.runner_up < 0, "premise: a negative runner-up"
+
+    r = resolve_one(
+        "5/1 Smith Street Fitzroy VIC 3065", record_unresolved=False, include_candidates=True
+    )
+    assert all(c.confidence > 0.0 for c in r.candidates), [c.confidence for c in r.candidates]

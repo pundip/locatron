@@ -429,19 +429,40 @@ def to_au_address(rec: GnafRecord) -> AuAddress:
     )
 
 
-def to_candidates(p: AuParse, winner_granularity: Granularity) -> list[Candidate]:
-    """The runners-up, and for a bare postcode the localities it could mean."""
+def hypothesis_granularity(h: StreetHypothesis) -> Granularity:
+    """How far down this reading gets on its own evidence.
+
+    Never `address` or `unit`, however good the hypothesis looks: those levels
+    mean a row was matched in address_ref, and a candidate is never looked up.
+    Claiming the winner's level for a runner-up said `address` for a reading that
+    had no street at all.
+    """
+    if h.street is not None:
+        return Granularity.STREET
+    return Granularity.LOCALITY if names_its_locality(h) else Granularity.POSTCODE
+
+
+def to_candidates(p: AuParse) -> list[Candidate]:
+    """The runners-up, and for a bare postcode the localities it could mean.
+
+    Each carries its own granularity, and anything that rounds to zero confidence
+    is dropped rather than listed: an alternate the scoring has already ruled out
+    is noise in a list whose whole job is to show what was close.
+    """
     if not p.hypotheses:
         return []
     winner_score = p.hypotheses[0].score
     out: list[Candidate] = []
     for h in p.hypotheses[1 : MAX_CANDIDATES + 1]:
         c = h.locality.candidate
+        confidence = au_confidence(h.score, winner_score, has_street=h.street is not None)
+        if confidence <= 0.0:
+            continue
         out.append(
             Candidate(
                 label=" ".join(x for x in (c.locality, c.state, c.postcode) if x),
-                confidence=au_confidence(h.score, winner_score, has_street=h.street is not None),
-                granularity=winner_granularity,
+                confidence=confidence,
+                granularity=hypothesis_granularity(h),
                 country="AUS",
                 admin1=c.state or None,
                 locality=c.locality or None,
@@ -532,7 +553,7 @@ def resolve_au(p: AuParse, au: AuGazetteer | None = None, **lookup_kwargs: Any) 
             else None
         ),
         warnings=list(result.warnings),
-        candidates=to_candidates(p, granularity),
+        candidates=to_candidates(p),
         unexplained=tuple(p.ts.text_of(s) for s in top.unexplained),
     )
 

@@ -161,7 +161,9 @@ def to_candidates(
             reason=reason,
         )
         for label, score, gran, country, admin1, locality, reason in rows
-        if score >= cutoff
+        # A candidate whose confidence rounds to zero is not an alternate, it is
+        # a reading the scoring already rejected. Listing it is noise.
+        if score >= cutoff and round(score, 4) > 0.0
     ]
     return out[: s.candidate_max]
 
