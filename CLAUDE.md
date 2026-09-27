@@ -117,6 +117,11 @@ groups on `norm_key`, which does not exist until that pass fills it in. That
 ordering is what lets it collapse punctuation variants without folding
 punctuation in SQL.
 
+Both `locatron_locality` and `locatron_street` carry a precomputed centroid, with
+100% coverage (18,551 and 532,182 rows). Street and locality fallbacks read those
+and **never aggregate `address_ref` at request time** — Melbourne 3000 alone is
+119,273 rows. The SQLite mirror carries the street centroid too.
+
 `locatron build streets` is genuinely last. It mirrors `locatron_street` into the
 local SQLite file and refuses to run if any `norm_key` is still NULL, which is how
 it proves the normalize pass happened — `locatron_street` has no `norm_key` of its
@@ -178,17 +183,34 @@ Learned the hard way. Do not rediscover these.
   the primary key covers fewer. Multiple decompositions collapse to one key —
   `('HAMILTON','CR')` and `('HAMILTON CR','')` both give `HAMILTON CR`. Aggregate
   to variant level first, then collapse with an explicit tiebreak.
-- G-NAF postcodes lose leading zeros on careless loads. NT is 0800–0899.
-  `LPAD(TRIM(POSTCODE),4,'0')` everywhere.
+- G-NAF postcodes lose leading zeros on careless loads. NT is 0800–0899. Pad
+  when **building** a derived table: `LPAD(TRIM(POSTCODE),4,'0')`.
+  Never pad in a **WHERE** clause against `address_ref`. Its `POSTCODE` is
+  already four characters on all 15,949,543 rows, so padding buys nothing and
+  wrapping the indexed column kills the index:
+  `WHERE POSTCODE = '0800'` is `type=ref`, 1 row, 1 ms;
+  `WHERE LPAD(POSTCODE,4,'0') = '0800'` is `type=ALL`, 15,886,279 rows, 10.6 s.
+- `address_ref` values carry **no** leading or trailing whitespace. Zero rows have
+  `col <> TRIM(col)` for `STREET_NAME`, `LOCALITY_NAME`, `STREET_TYPE`, `STATE` or
+  `NUMBER_FIRST`, so a `TRIM()` in a WHERE clause is the same self-inflicted
+  full scan as `LPAD`. Trim on the way out if you like, never on the way in.
+- `LATITUDE` and `LONGITUDE` are populated on every `address_ref` row — zero
+  blanks. The `CAST('' AS DECIMAL)` trap above still applies to other tables, and
+  guarding costs nothing, but it does not bite here.
 - G-NAF has **no PO Boxes**. Postal addresses resolve via `locatron_locality`
   rows with `is_postal_only = 1`.
 - `address_ref` uses blank strings, not NULLs. `NULLIF(TRIM(col),'')` before any
   NULL check.
 - `STATE` includes `OT` for external territories — exclude it from Australian
   bounding-box sanity checks.
-- Alias rows in G-NAF (`ALIAS_PRINCIPAL = 'ALIAS'`) point at their principal via
-  `PRINCIPAL_PID`. Exclude them from canonical aggregates; use them to seed
-  aliases.
+- Alias rows in G-NAF point at their principal via `PRINCIPAL_PID`. Exclude them
+  from canonical aggregates; use them to seed aliases. **The indicator values are
+  single letters, not words**: `ALIAS_PRINCIPAL` is `'P'` (15,108,510 rows) or
+  `'A'` (841,033). Querying `= 'PRINCIPAL'` matches nothing and returns silently.
+- `PRIMARY_SECONDARY` is `''`, `'S'` or `'P'`, and blank is the common case —
+  10,414,829 rows, against 4,966,618 `'S'` and 568,096 `'P'`. A blank means the
+  address is neither part of a group nor a group's head, so treat it as ordinary
+  rather than as missing data. A unit is an `'S'` row carrying `FLAT_NUMBER`.
 
 ## Repo layout
 
