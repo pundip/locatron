@@ -147,6 +147,14 @@ class Settings(BaseSettings):
     # when the input carries no Australian signal at all.
     score_locality_unqualified_penalty: float = Field(0.08, ge=0.0, le=1.0)
 
+    # How far below a same-named city an Australian locality is placed when the
+    # input gave no address-level evidence. 'Sydney, NSW' ties at 0.900 between
+    # the city and the SYDNEY 2000 locality, and the granularity tiebreak then
+    # picks the suburb; a stated state corroborates both equally, so it must not
+    # decide between them. Only needs to be enough to order the pair -- the
+    # city's own score is what gets reported.
+    score_metro_locality_margin: float = Field(0.01, ge=0.0, le=1.0)
+
     # Runner-ups within this much of the winner are emitted as candidates.
     candidate_margin: float = Field(0.15, ge=0.0, le=1.0)
     candidate_max: int = Field(8, ge=0, le=50)

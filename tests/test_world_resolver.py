@@ -547,3 +547,111 @@ def test_response_is_always_well_formed() -> None:
     assert got.elapsed_ms is not None and got.elapsed_ms >= 0
     assert got.resolved_at is not None
     assert 0.0 <= got.confidence <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# a metro area is not its CBD suburb
+# ---------------------------------------------------------------------------
+
+#: State code and full name, for building the three forms an input arrives in.
+_STATE_NAMES = {
+    "NSW": "New South Wales",
+    "VIC": "Victoria",
+    "QLD": "Queensland",
+    "WA": "Western Australia",
+    "SA": "South Australia",
+    "TAS": "Tasmania",
+    "NT": "Northern Territory",
+    "ACT": "Australian Capital Territory",
+}
+
+#: Every capital plus the larger regional cities, each of which also exists as an
+#: AU locality of the same name.
+_METRO = [
+    ("Sydney", "NSW"),
+    ("Melbourne", "VIC"),
+    ("Brisbane", "QLD"),
+    ("Perth", "WA"),
+    ("Adelaide", "SA"),
+    ("Hobart", "TAS"),
+    ("Darwin", "NT"),
+    ("Canberra", "ACT"),
+    ("Newcastle", "NSW"),
+    ("Geelong", "VIC"),
+    ("Wollongong", "NSW"),
+    ("Gold Coast", "QLD"),
+    ("Townsville", "QLD"),
+]
+
+
+def _three_forms(name: str, code: str) -> list[str]:
+    return [name, f"{name}, {code}", f"{name}, {_STATE_NAMES[code]}, Australia"]
+
+
+@needs_db
+@pytest.mark.parametrize(("name", "code"), _METRO, ids=[n for n, _ in _METRO])
+def test_a_metro_name_answers_city_in_every_form(name: str, code: str) -> None:
+    """Adding a state must not change what a city name means.
+
+    Before this rule, 8 of these 13 flipped from city to the CBD locality once a
+    state was added: 'Sydney' gave the city and 'Sydney, NSW' gave SYDNEY 2000.
+    Both proposals take the same score_explicit_admin1_bonus, so they tied at
+    0.900 and the granularity tiebreak handed it to the suburb.
+    """
+    for raw in _three_forms(name, code):
+        got = resolve_one(raw, record_unresolved=False)
+        assert got.granularity is Granularity.CITY, f"{raw!r} gave {got.granularity.value}"
+        assert got.locality is None, f"{raw!r} named locality {got.locality}"
+
+
+@needs_db
+@pytest.mark.parametrize(("name", "code"), _METRO, ids=[n for n, _ in _METRO])
+def test_the_three_forms_agree_with_each_other(name: str, code: str) -> None:
+    """Consistency across the forms is the property, not just the value: a
+    consumer sending 'Perth' and 'Perth, WA' from the same scrape should not get
+    two different kinds of answer."""
+    answers = {
+        resolve_one(raw, record_unresolved=False).granularity for raw in _three_forms(name, code)
+    }
+    assert len(answers) == 1, f"{name} disagrees across forms: {answers}"
+
+
+@needs_db
+def test_a_postcode_still_means_the_suburb() -> None:
+    """The rule is off when the input gives address-level evidence. With '2000'
+    the caller has named something narrower than a metro area and means it."""
+    got = resolve_one("Sydney NSW 2000", record_unresolved=False)
+    assert got.granularity is Granularity.LOCALITY
+    assert got.locality == "SYDNEY"
+    assert got.postcode == "2000"
+
+
+@needs_db
+def test_the_city_must_be_in_the_same_country() -> None:
+    """'Ryde' is a city on the Isle of Wight and a locality in New South Wales.
+    Preferring the city on a name match alone would answer 'Ryde NSW' with
+    England."""
+    got = resolve_one("Ryde NSW", record_unresolved=False)
+    assert got.granularity is Granularity.LOCALITY
+    assert got.country is not None and got.country.alpha3 == "AUS"
+    assert got.locality == "RYDE"
+
+
+@needs_db
+@pytest.mark.parametrize(
+    "raw", ["Carrum Downs VIC", "St Kilda East VIC", "Ku-ring-gai NSW", "Richmond VIC"]
+)
+def test_a_locality_that_is_not_a_city_is_untouched(raw: str) -> None:
+    """The rule needs a same-named city to fire. None of these have one, so they
+    keep answering locality."""
+    assert resolve_one(raw, record_unresolved=False).granularity is Granularity.LOCALITY
+
+
+@needs_db
+def test_the_demoted_locality_survives_as_a_candidate() -> None:
+    """Demoted, not discarded: the suburb is still a plausible reading and a
+    caller asking for candidates should see it, with the reason on it."""
+    got = resolve_one("Sydney, NSW", record_unresolved=False, include_candidates=True)
+    assert got.granularity is Granularity.CITY
+    localities = [c for c in got.candidates if c.locality == "SYDNEY"]
+    assert localities, "the CBD locality should still be offered as an alternate"

@@ -207,6 +207,10 @@ class Proposal:
     postcode: str | None = None
     geo: Geo | None = None
     score: float = 0.0
+    place_name: str | None = None
+    """The bare name this proposal is for -- the city's name, or the locality's.
+    Kept apart from `label`, which is a human-readable summary, so a city and a
+    locality of the same name can be recognised as the same place."""
 
     def finalise(self) -> Proposal:
         self.score = self.parts.total
@@ -288,6 +292,7 @@ def _city_proposals(
                 admin1_name=city.admin_name,
                 admin1_code=admin_code,
                 geo=_city_geo(city),
+                place_name=city.name,
             ).finalise()
         )
     return out
@@ -363,6 +368,7 @@ def _locality_proposals(
                 locality=row.locality,
                 postcode=row.postcode,
                 geo=_locality_geo(row),
+                place_name=row.locality,
             ).finalise()
         )
     return out
@@ -603,6 +609,65 @@ def _coarse_proposals(
 # ---------------------------------------------------------------------------
 
 
+def _prefer_city_over_metro_locality(
+    proposals: list[Proposal], ev: Evidence, s: Settings
+) -> None:
+    """Demote an Australian locality that shares its name with the city, in place.
+
+    A capital's name means the metro area unless the input says otherwise.
+    'Sydney, NSW' scored the city and the SYDNEY 2000 locality at 0.900 each, and
+    `_rank`'s tiebreak toward the more specific answer then returned the CBD
+    suburb -- so adding a state flipped the answer, while 'Sydney' alone correctly
+    gave the city. A stated state corroborates both equally (each takes the same
+    `score_explicit_admin1_bonus`), so it must not be what decides between them.
+
+    Applied only when the input gives no address-level evidence. A postcode is the
+    one such signal that can reach this path: with '2000' the caller has named
+    something narrower than a metro area and means it. A street number or a street
+    match cannot appear here at all, because either would have routed the input to
+    the AU address path.
+
+    The city must be a plausible name for the same place, not merely the same
+    word: same country, and agreeing with any stated state. Without that check
+    'Ryde NSW' would prefer Ryde on the Isle of Wight over RYDE in New South
+    Wales.
+
+    Runs after `score_max` has been applied, not before. Both proposals saturate
+    at 0.98 once a country is also stated, so a demotion applied earlier was
+    capped straight back into a tie -- which is why
+    'Sydney, New South Wales, Australia' still returned the suburb after the first
+    attempt. The score is set directly rather than through `finalise()` for the
+    same reason: `parts` is the pre-cap breakdown, as it already is for country
+    bias, and re-totalling it here would undo the cap.
+    """
+    if ev.postcode:
+        return
+
+    best_city: dict[str, float] = {}
+    for p in proposals:
+        if p.granularity is not Granularity.CITY or not p.place_name:
+            continue
+        if p.alpha3 != "AUS":
+            continue
+        if ev.state and p.admin1_code and p.admin1_code != ev.state:
+            continue
+        key = normalize(p.place_name)
+        best_city[key] = max(best_city.get(key, 0.0), p.score)
+    if not best_city:
+        return
+
+    for p in proposals:
+        if p.granularity is not Granularity.LOCALITY or not p.place_name:
+            continue
+        city_score = best_city.get(normalize(p.place_name))
+        if city_score is None or p.score < city_score:
+            continue
+        # Recorded in the breakdown as well as on the score, so Candidate.reason
+        # explains why the suburb came second.
+        p.parts.penalties["metro_area"] = p.score - city_score + s.score_metro_locality_margin
+        p.score = city_score - s.score_metro_locality_margin
+
+
 def _rank(
     proposals: list[Proposal], ev: Evidence, bias_alpha3: str | None, s: Settings
 ) -> list[Proposal]:
@@ -619,6 +684,9 @@ def _rank(
     # would report a gazetteer lookup as certainty, so cap below it.
     for p in proposals:
         p.score = min(p.score, s.score_max)
+
+    # After the cap: see the note in _prefer_city_over_metro_locality.
+    _prefer_city_over_metro_locality(proposals, ev, s)
 
     # Granularity breaks exact score ties toward the more specific answer, then
     # the label, so the result is stable across dict orderings.

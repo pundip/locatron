@@ -33,3 +33,4 @@ Sao Paulo,city,BRA,,,transliteration
 17-99 Wills Street Melbourne VIC 3000,address,AUS,VIC,MELBOURNE,guards the range-mismatch cap: no 17-99 row exists so it matches 17 alone and confidence is capped
 "Melbourne, Victoria, Australia",city,AUS,VIC,,metro area not the MELBOURNE 3000 locality; a stated state is not an address signal so this stays on the world path
 "Perth, Western Australia",city,AUS,WA,,metro area not the PERTH 6000 locality; guards the same rule with the state spelled out and no country word
+"Sydney, New South Wales, Australia",city,AUS,NSW,,metro area; state token must not promote the CBD locality over the city
