@@ -242,6 +242,35 @@ named the locality — only the postcode, which can span several localities. So
 `3201` answers `postcode` with `VIC`, and the localities it could mean go in
 `candidates`. `Carrum Downs VIC` names its locality and answers `locality`.
 
+### The response envelope
+
+One shape covers both paths, so a consumer never branches on which resolver ran.
+A world answer carries the same keys an Australian one does, with nulls where
+there is nothing to report.
+
+- **`au_address` is the full G-NAF record** — every column of the matched
+  `address_ref` row, not a summary of it. `tests/test_schemas.py` asserts the
+  correspondence against `GnafRecord` in both directions, so a column added by an
+  upstream refresh fails loudly rather than quietly not being forwarded. Blank
+  strings become `None`, because a consumer writing `if flat_number` should not
+  have to know that `address_ref` uses `''` for absent. `formatted` is G-NAF's own
+  `ADDRESS_LABEL`.
+
+  There is deliberately **no `gnaf` key**. `au_address` is that object, and a
+  second top-level key with the same contents would put two sources of truth in
+  one envelope. Populated for `unit` and `address` only: `street` and below come
+  from precomputed centroids, and no single row stands behind them.
+- **`canonical_pid`** is the pid to join and deduplicate on — the principal's when
+  the match is a G-NAF alias, the matched row's own otherwise, `None` below
+  address granularity.
+- **`principal`** is set only for an alias match. The alias row itself stays the
+  answer, because it carries the street and number the input used; this says which
+  row G-NAF considers canonical.
+- **`candidates`** holds up to three alternates. For a bare postcode this is where
+  the localities it could mean go, and for a demoted CBD locality it is where that
+  reading goes.
+- **`warnings`** explains every degradation and every confidence cap in words.
+
 ## Technical decisions
 
 - **Synchronous SQLAlchemy with `def` endpoints**, not `async def`. FastAPI runs
@@ -312,17 +341,18 @@ locatron/
 │   ├── normalize.py          # THE contract
 │   ├── db/                   # mysql.py, local.py (sqlite)
 │   ├── gazetteer/            # loaders for countries, cities, localities, streets
-│   ├── parse/                # tokenizer.py, au_address.py, place.py
-│   ├── resolve/              # pipeline.py, au.py, world.py, scoring.py
-│   ├── cache.py
-│   ├── schemas.py
+│   ├── parse/                # tokens, components, locality, street, lookup, scoring
+│   ├── resolve/              # pipeline.py, au.py, world.py, scoring.py, unresolved.py
+│   ├── schemas.py            # the response envelope; au_address is the G-NAF record
 │   ├── cli.py                # resolve from the terminal, no HTTP needed
 │   ├── api/app.py            # :8080
 │   └── bulk/app.py           # :8081
 │   └── build/                # streets.py, the SQLite mirror build
 ├── scripts/
 │   ├── normalize_pass.py
-│   └── dedupe_locality.py    # collapses punctuation-variant localities
+│   ├── dedupe_locality.py    # collapses punctuation-variant localities
+│   ├── route_probe.py        # which path each golden row takes, and why
+│   └── resolve_bench.py      # server-side latency per path
 ├── sql/
 ├── tests/
 │   └── golden/golden.csv     # input → expected output

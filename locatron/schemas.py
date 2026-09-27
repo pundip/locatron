@@ -1,7 +1,16 @@
 """The response envelope.
 
 One schema covers both the loose-place path and the AU address path, so
-consumers never have to branch on which resolver ran.
+consumers never have to branch on which resolver ran. A world answer carries the
+same keys an Australian one does, with nulls where there is nothing to report.
+
+`au_address` is the **full G-NAF record** -- every column of the matched
+`address_ref` row, not a summary of it. There is deliberately no separate `gnaf`
+key: `au_address` is that object, and a second top-level key holding the same
+contents would put two sources of truth in one envelope. `tests/test_schemas.py`
+asserts the correspondence against `parse.lookup.GnafRecord` in both directions,
+so a column added by an upstream refresh fails loudly rather than quietly not
+being forwarded.
 
 Resolution never raises for unresolvable input. An unresolvable string comes
 back as HTTP 200 with granularity=UNRESOLVED and confidence=0.0.
