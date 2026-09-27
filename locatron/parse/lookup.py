@@ -333,32 +333,44 @@ def match_range(
     return best_without_unit(records), False
 
 
+@dataclass(frozen=True, slots=True)
+class PrincipalRef:
+    """The principal an alias row points at. Reference only, not the answer."""
+
+    pid: str
+    address: str
+    """ADDRESS_LABEL of the principal, which is G-NAF's own formatting."""
+
+
 def follow_alias(
     record: GnafRecord, principal: PrincipalSource
-) -> tuple[GnafRecord, tuple[str, ...]]:
-    """Resolve an alias row to its principal, or keep the alias if it dangles.
+) -> tuple[GnafRecord, PrincipalRef | None, tuple[str, ...]]:
+    """(matched record, principal reference, warnings) for a possibly-alias row.
 
-    An alias row is a real answer -- the input used a name G-NAF records as an
-    alias -- so it is never discarded. It is followed, because the principal is
-    the canonical record and the one a consumer should store. 5.27% of rows are
-    aliases.
+    The alias row IS the answer. It carries the street and number the input
+    actually used and its own coordinates, so returning the principal instead
+    would answer a question nobody asked -- somebody who types
+    '12 Alice Street Amaroo' wants 12 Alice Street, not 49 Rollston Street.
+
+    The principal still matters, because it is the row a consumer should join on
+    and deduplicate by, so it comes back alongside as a reference and as
+    canonical_pid. 5.27% of address_ref rows are aliases.
     """
     if not record.is_alias:
-        return record, ()
+        return record, None, ()
 
     target = principal(record.principal_pid)
     if target is None:
-        return record, (
-            f"matched an alias record ({record.address_detail_pid}) whose "
-            f"principal {record.principal_pid!r} could not be found; returning "
-            f"the alias",
+        return (
+            record,
+            None,
+            (
+                f"matched an alias record ({record.address_detail_pid}) whose "
+                f"principal {record.principal_pid!r} could not be found",
+            ),
         )
-    alias_name = " ".join(x for x in (record.street_name, record.street_type) if x)
-    principal_name = " ".join(x for x in (target.street_name, target.street_type) if x)
-    return target, (
-        f"input used the alias street {alias_name!r}; returned the principal "
-        f"record {principal_name!r} ({target.address_detail_pid})",
-    )
+    ref = PrincipalRef(pid=target.address_detail_pid, address=target.address_label)
+    return record, ref, (f"the input address is an alias of {ref.address}",)
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +413,13 @@ class LookupResult:
     hypothesis: object
     """The StreetHypothesis this came from, carried so a caller can explain the
     answer without re-running the parse."""
+    principal: PrincipalRef | None = None
+    """Set only when `record` is an alias row. The alias is the answer; this says
+    which principal it belongs to, for a consumer that needs to deduplicate."""
+    canonical_pid: str = ""
+    """The pid to join and deduplicate on: the principal's when the match is an
+    alias, the record's own otherwise. Blank below address granularity, where
+    there is no G-NAF row."""
     confidence_cap: float | None = None
     """Set when something about the match should stop a caller reporting full
     confidence. None means nothing capped it."""
@@ -500,12 +519,20 @@ def lookup(
     if unit:
         hit = match_unit(rows, unit)
         if hit is not None:
-            hit, alias_warnings = follow_alias(
+            hit, ref, alias_warnings = follow_alias(
                 hit, counted_principal(principal, trips, "row_by_pid")
             )
             warnings.extend(alias_warnings)
             return _result(
-                Granularity.UNIT, hit.lat, hit.lng, hit, warnings, hypothesis, trips, cap
+                Granularity.UNIT,
+                hit.lat,
+                hit.lng,
+                hit,
+                warnings,
+                hypothesis,
+                trips,
+                cap,
+                ref,
             )
         # The building exists, the flat does not. Return the building rather than
         # nothing, and say which part failed.
@@ -521,10 +548,20 @@ def lookup(
     if chosen is None:
         return _result(Granularity.STREET, s_lat, s_lng, None, warnings, hypothesis, trips, cap)
 
-    chosen, alias_warnings = follow_alias(chosen, counted_principal(principal, trips, "row_by_pid"))
+    chosen, ref, alias_warnings = follow_alias(
+        chosen, counted_principal(principal, trips, "row_by_pid")
+    )
     warnings.extend(alias_warnings)
     return _result(
-        Granularity.ADDRESS, chosen.lat, chosen.lng, chosen, warnings, hypothesis, trips, cap
+        Granularity.ADDRESS,
+        chosen.lat,
+        chosen.lng,
+        chosen,
+        warnings,
+        hypothesis,
+        trips,
+        cap,
+        ref,
     )
 
 
@@ -537,7 +574,16 @@ def _result(
     hypothesis,
     trips: RoundTrips,
     cap: float | None = None,
+    principal_ref: PrincipalRef | None = None,
 ) -> LookupResult:
+    # An alias's canonical identity is its principal's; everything else is its
+    # own. Blank when there is no G-NAF row to identify.
+    if principal_ref is not None:
+        canonical = principal_ref.pid
+    elif record is not None:
+        canonical = record.address_detail_pid
+    else:
+        canonical = ""
     return LookupResult(
         granularity=granularity,
         lat=lat,
@@ -545,6 +591,8 @@ def _result(
         record=record,
         warnings=tuple(warnings),
         hypothesis=hypothesis,
+        principal=principal_ref,
+        canonical_pid=canonical,
         confidence_cap=cap,
         round_trips=trips.count,
         round_trip_labels=tuple(trips.labels),

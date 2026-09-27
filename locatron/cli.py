@@ -465,6 +465,12 @@ def _lookup_lines(top, units, numbers, boxes) -> list[str]:
         ):
             if value:
                 out.append(f"    {label:<11}{value}")
+    if result.canonical_pid:
+        out.append(f"  canonical    {result.canonical_pid}")
+    if result.principal is not None:
+        out.append("  principal")
+        out.append(f"    {'pid':<11}{result.principal.pid}")
+        out.append(f"    {'address':<11}{result.principal.address}")
     for w in result.warnings:
         out.append(f"  ! {w}")
     return out

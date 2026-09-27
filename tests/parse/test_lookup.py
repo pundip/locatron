@@ -465,18 +465,43 @@ def test_an_alpha_suffix_stays_inside_number_first() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_an_alias_row_is_followed_to_its_principal() -> None:
+def test_an_alias_row_is_returned_as_itself_not_as_its_principal() -> None:
+    """Somebody who types '12 Alice Street Amaroo' wants 12 Alice Street. The
+    alias row carries that street, that number and its own coordinates, so it is
+    the answer; the principal comes back beside it as the id to join on."""
     r = _lookup(
         _hyp(locality="AMAROO", state="ACT", postcode="2914", street_name="ALICE"),
         number_first="12",
     )
     assert r.granularity == Granularity.ADDRESS
     assert r.record is not None
-    assert r.record.address_detail_pid == "GAACT714849931"
-    assert r.record.address_label == "49 ROLLSTON ST, AMAROO ACT 2914"
-    assert r.record.alias_principal == "P", "the returned record is the principal"
-    assert any("alias street 'ALICE ST'" in w for w in r.warnings)
+    assert r.record.address_detail_pid == "GAACT714849932"
+    assert r.record.address_label == "12 ALICE ST, AMAROO ACT 2914"
+    assert r.record.alias_principal == "A", "the returned record is the alias itself"
+    assert (r.lat, r.lng) == (-35.16673415, 149.13244879), "the alias row's coordinates"
+
+    assert r.principal is not None
+    assert r.principal.pid == "GAACT714849931"
+    assert r.principal.address == "49 ROLLSTON ST, AMAROO ACT 2914"
+    assert r.canonical_pid == "GAACT714849931", "dedupe on the principal, not the alias"
+    assert "the input address is an alias of 49 ROLLSTON ST, AMAROO ACT 2914" in r.warnings
     assert r.round_trips == 2, "the follow is the second trip, and the budget is 2"
+
+
+def test_a_principal_match_is_its_own_canonical_pid() -> None:
+    r = _lookup(_hyp(), number_first="1")
+    assert r.record is not None
+    assert r.principal is None
+    assert r.canonical_pid == r.record.address_detail_pid
+
+
+def test_below_address_granularity_there_is_no_canonical_pid() -> None:
+    """Street and locality answers come from centroids, so there is no G-NAF row
+    to identify and nothing for a consumer to join on."""
+    r = _lookup(_hyp(street=False))
+    assert r.granularity == Granularity.LOCALITY
+    assert r.canonical_pid == ""
+    assert r.principal is None
 
 
 def test_a_dangling_principal_keeps_the_alias_rather_than_returning_nothing() -> None:
@@ -487,14 +512,16 @@ def test_a_dangling_principal_keeps_the_alias_rather_than_returning_nothing() ->
         address_label="9 NOWHERE ST",
         number_first="9",
     )
-    got, warnings = follow_alias(orphan, lambda pid: None)
+    got, ref, warnings = follow_alias(orphan, lambda pid: None)
     assert got.address_detail_pid == "orphan"
+    assert ref is None, "nothing to point at, so no principal block"
     assert any("could not be found" in w for w in warnings)
 
 
 def test_a_principal_row_is_not_followed() -> None:
-    got, warnings = follow_alias(SMITH_1[0], lambda pid: pytest.fail("should not follow"))
+    got, ref, warnings = follow_alias(SMITH_1[0], lambda pid: pytest.fail("should not follow"))
     assert got is SMITH_1[0]
+    assert ref is None
     assert warnings == ()
 
 
@@ -609,13 +636,15 @@ def test_coordinates_come_back_as_floats_not_blank_strings() -> None:
 
 
 @needs_db
-def test_the_real_alias_follow_reaches_the_principal() -> None:
+def test_the_real_alias_keeps_its_own_row_and_names_its_principal() -> None:
     rows = rows_for_number(("AMAROO", "ALICE", "ST", "12"))
     assert rows and rows[0].alias_principal == "A"
-    got, warnings = follow_alias(rows[0], row_by_pid)
-    assert got.address_detail_pid == "GAACT714849931"
-    assert got.alias_principal == "P"
-    assert warnings
+    got, ref, warnings = follow_alias(rows[0], row_by_pid)
+    assert got is rows[0], "the alias row is the answer"
+    assert ref is not None
+    assert ref.pid == "GAACT714849931"
+    assert ref.address == "49 ROLLSTON ST, AMAROO ACT 2914"
+    assert warnings == (f"the input address is an alias of {ref.address}",)
 
 
 @needs_db
