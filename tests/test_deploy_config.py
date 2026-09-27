@@ -374,7 +374,17 @@ sed "s/REPLACE_ME/abc123def4567890/g" "$REPO/deploy/nginx.conf" > "$NGX"
 
 # Stubs. sudo passes through; the rest record and obey the env.
 printf '#!/usr/bin/env bash\nexec "$@"\n' > "$STUBS/sudo"
-printf '#!/usr/bin/env bash\necho "systemctl $*" >> "$STUB_LOG"\n' > "$STUBS/systemctl"
+cat > "$STUBS/systemctl" <<'SCSTUB'
+#!/usr/bin/env bash
+echo "systemctl $*" >> "$STUB_LOG"
+for arg in "$@"; do
+    case "$arg" in
+        is-active) echo "${STUB_SERVICE_STATE:-active}"; exit 0 ;;
+        show)      echo "${STUB_STARTED_UTC:-}"; exit 0 ;;
+    esac
+done
+exit 0
+SCSTUB
 printf '#!/usr/bin/env bash\necho "nginx $*" >> "$STUB_LOG"\nexit 0\n' > "$STUBS/nginx"
 printf '#!/usr/bin/env bash\necho "uv $*" >> "$STUB_LOG"\n' > "$STUBS/uv"
 # The service user does not exist here, so ownership calls are recorded only.
@@ -415,12 +425,34 @@ chmod +x "$VENVDIR/python" "$VENVDIR/locatron"
 
 export MIRROR_PATH="$MIRRORDIR/gazetteer.sqlite"
 
+# Outside the checkout, as it is on the container.
+DSHA="$WORK/.deployed-sha"
+
+head_sha() { git -C "$APP" rev-parse HEAD; }
+
+# Record a completed deploy, the way a successful run would.
+mark_deployed() { printf '%s\n' "${1:-$(head_sha)}" > "$DSHA"; }
+
+# The restart step needs a unit installed and the module it points at to exist.
+# Without both it skips the service, and nothing is ever recorded as deployed.
+enable_services() {
+    mkdir -p "$APP/locatron/api" "$APP/locatron/bulk"
+    : > "$APP/locatron/api/app.py"
+    : > "$APP/locatron/bulk/app.py"
+    cp "$APP"/deploy/systemd/locatron-*.service "$SYSD/"
+    git -C "$APP" add -A >/dev/null 2>&1
+    git -C "$APP" commit -qm services >/dev/null 2>&1
+    git -C "$APP" push -q origin master >/dev/null 2>&1 || true
+    git -C "$APP" fetch -q origin 2>/dev/null
+}
+
 run_deploy() {
     LOCATRON_APP_DIR="$APP" \
     LOCATRON_VENV="$WORK/venv" \
     LOCATRON_ENV_FILE="$ENVF" \
     LOCATRON_SYSTEMD_DIR="$SYSD" \
     LOCATRON_NGINX_SITE="$NGX" \
+    LOCATRON_DEPLOYED_SHA_FILE="$DSHA" \
     LOCATRON_BRANCH=master \
     bash "$APP/deploy/deploy.sh" "$@" 2>&1
 }
@@ -447,9 +479,11 @@ def _run_fetch(scenario: str) -> tuple[int, str, str]:
 
 
 def test_up_to_date_with_a_fresh_mirror_exits_early() -> None:
-    """The shortcut still exists. Nothing is rebuilt and nothing restarts."""
+    """The shortcut still exists, for the one case that earns it: origin, the
+    checkout and the deployed record all agree, and the mirror is current."""
     rc, out, calls = _run_fetch(
         r"""
+mark_deployed
 : > "$MIRROR_PATH"
 export CHECK_MIRROR_RC=0 DIGEST_RC=0
 rc=0; run_deploy || rc=$?
@@ -466,6 +500,7 @@ def test_up_to_date_with_a_missing_mirror_builds_and_restarts() -> None:
     """The bug: no new commit does not mean nothing to do."""
     rc, out, calls = _run_fetch(
         r"""
+mark_deployed
 rm -f "$MIRROR_PATH"
 export CHECK_MIRROR_RC=0 DIGEST_RC=0
 rc=0; run_deploy || rc=$?
@@ -497,6 +532,7 @@ def test_up_to_date_with_a_changed_source_digest_builds() -> None:
     shortcut used to hide."""
     rc, out, calls = _run_fetch(
         r"""
+mark_deployed
 : > "$MIRROR_PATH"
 export CHECK_MIRROR_RC=0 DIGEST_RC=1
 rc=0; run_deploy || rc=$?
@@ -513,6 +549,7 @@ def test_an_unreachable_database_does_not_force_a_rebuild() -> None:
     restart services over a network blip."""
     rc, out, calls = _run_fetch(
         r"""
+mark_deployed
 : > "$MIRROR_PATH"
 export CHECK_MIRROR_RC=0 DIGEST_RC=2
 rc=0; run_deploy || rc=$?
@@ -528,6 +565,7 @@ report "$rc"
 def test_no_mirror_flag_keeps_the_old_shortcut() -> None:
     rc, out, calls = _run_fetch(
         r"""
+mark_deployed
 rm -f "$MIRROR_PATH"
 rc=0; run_deploy --no-mirror || rc=$?
 report "$rc"
@@ -551,3 +589,175 @@ report "$rc"
     )
     assert rc == 0, out
     assert calls.count("python digest") == 1, calls
+
+
+# ---------------------------------------------------------------------------
+# What is deployed, as opposed to what has been fetched
+# ---------------------------------------------------------------------------
+
+
+def test_a_fetch_that_never_restarted_does_not_count_as_deployed() -> None:
+    """The bug that left production a day behind.
+
+    A deploy fetched the commit and then failed before the restart. The checkout
+    matched origin, so the shortcut said "nothing to do" on every later run while
+    the services kept serving the previous commit -- and nothing in the repo could
+    tell you, because the checkout looked perfect.
+
+    Here the deployed record names an older commit, which is exactly the state
+    that failed deploy leaves behind. The run must not shortcut.
+    """
+    rc, out, calls = _run_fetch(
+        r"""
+enable_services
+mark_deployed 0000000000000000000000000000000000000000
+: > "$MIRROR_PATH"
+export CHECK_MIRROR_RC=0 DIGEST_RC=0
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "nothing to do" not in out
+    assert "the last completed deploy was 0000000" in out
+    assert "fetched but never restarted into service" in out
+    assert "systemctl restart locatron-api" in calls
+
+
+def test_no_deployed_record_at_all_means_deploy() -> None:
+    """A missing file is not evidence of anything. It is the state on the first
+    run after this record was introduced, and also what a deploy that died early
+    leaves behind."""
+    rc, out, calls = _run_fetch(
+        r"""
+enable_services
+rm -f "$DSHA"
+: > "$MIRROR_PATH"
+export CHECK_MIRROR_RC=0 DIGEST_RC=0
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "nothing to do" not in out
+    assert "no record of a completed deploy" in out
+    assert "systemctl restart locatron-api" in calls
+
+
+def test_a_successful_restart_records_the_sha_outside_the_checkout() -> None:
+    rc, out, _ = _run_fetch(
+        r"""
+enable_services
+rm -f "$DSHA"
+: > "$MIRROR_PATH"
+rc=0; run_deploy || rc=$?
+echo "recorded=$(cat "$DSHA" 2>/dev/null)"
+echo "head=$(head_sha)"
+echo "inside_checkout=$(git -C "$APP" status --porcelain --ignored | grep -c deployed-sha)"
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    recorded = next(x for x in out.splitlines() if x.startswith("recorded="))[len("recorded=") :]
+    head = next(x for x in out.splitlines() if x.startswith("head="))[len("head=") :]
+    assert recorded == head, out
+    assert "inside_checkout=0" in out, "the record must live outside the checkout"
+
+
+def test_the_record_is_written_only_after_the_services_are_verified_up() -> None:
+    """A unit that restarts and then dies has not deployed anything. The deploy
+    fails, and the record keeps naming the commit that is actually in service.
+
+    `journalctl` is deliberately not stubbed here, so this also covers the deploy
+    reaching its own error message when the journal cannot be read: under pipefail
+    a failing `journalctl | sed` used to abort the script first, losing the only
+    line that said which service died.
+    """
+    rc, out, _ = _run_fetch(
+        r"""
+enable_services
+mark_deployed 1111111111111111111111111111111111111111
+: > "$MIRROR_PATH"
+export STUB_SERVICE_STATE=failed
+rc=0; run_deploy || rc=$?
+echo "still=$(cat "$DSHA" 2>/dev/null)"
+report "$rc"
+"""
+    )
+    assert rc != 0, out
+    assert "did not come up" in out
+    assert "still=1111111111111111111111111111111111111111" in out, (
+        "a failed restart must not overwrite the record"
+    )
+
+
+def test_a_second_run_after_a_real_deploy_does_nothing() -> None:
+    """The shortcut has to still work, or every deploy does the full job forever.
+    Two runs back to back: the first deploys and records, the second stops."""
+    rc, out, calls = _run_fetch(
+        r"""
+enable_services
+rm -f "$DSHA"
+: > "$MIRROR_PATH"
+run_deploy > "$WORK/first.log" 2>&1; echo "first=$?"
+grep -c 'systemctl restart' "$WORK/first.log" > /dev/null
+: > "$STUB_LOG"
+rc=0; run_deploy || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "first=0" in out
+    assert "deployed, and the mirror is current, nothing to do" in out
+    assert "systemctl restart" not in calls
+
+
+def test_status_reports_both_shas_without_deploying() -> None:
+    rc, out, calls = _run_fetch(
+        r"""
+enable_services
+mark_deployed 2222222222222222222222222222222222222222
+rc=0; run_deploy --status || rc=$?
+report "$rc"
+"""
+    )
+    assert rc != 0, "drift must be reported through the exit code too"
+    assert "checkout  " in out
+    assert "deployed  2222222" in out
+    assert "the checkout is ahead of what was deployed" in out
+    assert "Stale:" in out
+    assert "systemctl restart" not in calls
+    assert "uv pip install" not in calls
+
+
+def test_status_warns_when_the_service_predates_the_deployed_commit() -> None:
+    """The other half of the same failure: the SHA can be right while the process
+    running it is older than the commit. A service that started in 2020 is not
+    running a commit made today, whatever the record says."""
+    rc, out, _ = _run_fetch(
+        r"""
+enable_services
+mark_deployed
+export STUB_STARTED_UTC="2020-01-01 00:00:00 UTC"
+rc=0; run_deploy --status || rc=$?
+report "$rc"
+"""
+    )
+    assert rc != 0, out
+    assert "started 2020-01-01" in out
+    assert "was committed, so it is running older code" in out
+
+
+def test_status_is_quiet_when_everything_agrees() -> None:
+    rc, out, _ = _run_fetch(
+        r"""
+enable_services
+mark_deployed
+export STUB_STARTED_UTC="2099-01-01 00:00:00 UTC"
+rc=0; run_deploy --status || rc=$?
+report "$rc"
+"""
+    )
+    assert rc == 0, out
+    assert "Current" in out
+    assert "WARNING" not in out

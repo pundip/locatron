@@ -174,6 +174,25 @@ It fetches, installs dependencies, builds the SQLite street mirror if it is
 missing or stale, runs tests, runs `locatron check`, installs changed systemd and
 nginx files, then restarts services. `deploy/install.sh` is for first-time setup
 or repair only.
+
+What is *deployed* is recorded in `/opt/locatron/.deployed-sha`, owned by root and
+deliberately outside the checkout so `git reset --hard` cannot touch it. It is
+written only after the services restart and are verified up, and the "nothing to
+do" shortcut now requires origin, the checkout **and** that file to agree. Before
+this, the shortcut compared the checkout against origin only, so a deploy that
+fetched and then failed before the restart left the checkout looking perfect while
+production kept serving the previous commit — and every later run reported nothing
+to do. Production was a day stale that way once.
+
+To ask what is running without deploying anything:
+
+```bash
+/opt/locatron/app/deploy/deploy.sh --status
+```
+
+It prints the checkout SHA, the deployed SHA and each service's start time, warns
+when a service started before the commit it is supposed to be running, and exits
+non-zero on any drift — so it works from cron or a health check, not just by eye.
 On the container, CLI commands go through `deploy/lc.sh`. Never a bare `uv run` as
 root:
 ```bash

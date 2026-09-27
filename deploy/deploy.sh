@@ -8,6 +8,7 @@
 #   /opt/locatron/app/deploy/deploy.sh --no-config
 #   /opt/locatron/app/deploy/deploy.sh --no-mirror
 #   /opt/locatron/app/deploy/deploy.sh --config-only
+#   /opt/locatron/app/deploy/deploy.sh --status      # what is running, no deploy
 #
 # Assumes deploy/install.sh has already run. If the checkout or venv does not
 # exist yet, run install.sh instead.
@@ -24,6 +25,14 @@
 #
 # Rebuilds the SQLite street mirror when it is missing, stale or out of step
 # with locatron_street, before services restart. --no-mirror skips it.
+#
+# Records the deployed commit in /opt/locatron/.deployed-sha after the services
+# come up, and refuses to take the "nothing to do" shortcut unless origin, the
+# checkout and that file all agree. A deploy that fetches and then fails before
+# the restart used to leave the checkout matching origin, so every later run
+# reported nothing to do while production stayed on the previous commit.
+# --status prints the checkout SHA, the deployed SHA and each service's start
+# time without deploying anything.
 #
 # Roll back: the previous commit is printed at the end.
 #     git -C /opt/locatron/app reset --hard <sha>
@@ -42,11 +51,20 @@ BRANCH="${LOCATRON_BRANCH:-main}"
 SYSTEMD_DIR="${LOCATRON_SYSTEMD_DIR:-/etc/systemd/system}"
 NGINX_SITE="${LOCATRON_NGINX_SITE:-/etc/nginx/sites-available/locatron}"
 
+# What is actually running, as opposed to what has been fetched. Written only
+# after services restart successfully, owned by root, and deliberately outside
+# the checkout so `git reset --hard` cannot touch it.
+DEPLOYED_SHA_FILE="${LOCATRON_DEPLOYED_SHA_FILE:-$(dirname "$APP_DIR")/.deployed-sha}"
+
+# Services whose restart counts as deploying the code.
+SERVICES=(locatron-api locatron-bulk)
+
 SKIP_TESTS=0
 FORCE=0
 NO_CONFIG=0
 CONFIG_ONLY=0
 NO_MIRROR=0
+STATUS_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -56,7 +74,8 @@ while [[ $# -gt 0 ]]; do
         --no-config)   NO_CONFIG=1; shift ;;
         --no-mirror)   NO_MIRROR=1; shift ;;
         --config-only) CONFIG_ONLY=1; shift ;;
-        -h|--help)     sed -n '3,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --status)      STATUS_ONLY=1; shift ;;
+        -h|--help)     sed -n '3,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)             echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -328,6 +347,118 @@ build_mirror() {
     MIRROR_REASON=""
 }
 
+# ---------------------------------------------------------------------------
+# What is deployed, as opposed to what has been fetched.
+#
+# The two are not the same thing, and conflating them cost a day of production
+# running old code. The old shortcut compared the checkout against origin: a
+# deploy that fetched and then failed before the restart left the checkout at
+# origin with the services still on the previous commit, so every later run
+# reported "nothing to do" and changed nothing. Nothing in the repo could tell
+# you otherwise, because the checkout looked perfect.
+#
+# So the record of what is running lives outside git, is written only after a
+# restart actually succeeds, and is consulted before any shortcut is taken.
+
+# The SHA of the last successful deploy, or empty if there is no usable record.
+deployed_sha() {
+    [[ -f "$DEPLOYED_SHA_FILE" ]] || return 0
+    tr -cd '0-9a-f' < "$DEPLOYED_SHA_FILE" | head -c 40
+}
+
+record_deployed_sha() {
+    local staged
+    staged=$(new_tmp)
+    TMP_FILES+=("$staged")
+    printf '%s
+' "$1" > "$staged"
+    # Through $SUDO, so the file ends up owned by root on the container: the app
+    # user must not be able to forge the answer to "what is running?".
+    $SUDO install -m 0644 "$staged" "$DEPLOYED_SHA_FILE"
+}
+
+# Epoch seconds when a unit last became active, or empty when it is not running.
+service_started_at() {
+    local svc="$1" mono btime stamp
+
+    # Preferred: microseconds since boot plus the boot time from /proc. Exact,
+    # and it parses nothing -- which matters, because `date -d` rejects the
+    # timezone abbreviations systemd prints by default ("AEST" is not a date).
+    mono=$($SUDO systemctl show -p ActiveEnterTimestampMonotonic --value "$svc" 2>/dev/null || true)
+    btime=$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null || true)
+    if [[ "$mono" =~ ^[0-9]+$ ]] && (( mono > 0 )) && [[ "$btime" =~ ^[0-9]+$ ]]; then
+        printf '%s
+' $(( btime + mono / 1000000 ))
+        return 0
+    fi
+
+    # Fallback: the text form, asked for in UTC so that it is parseable at all.
+    stamp=$($SUDO systemctl --timestamp=utc show -p ActiveEnterTimestamp --value "$svc" 2>/dev/null || true)
+    [[ -n "$stamp" ]] || stamp=$($SUDO systemctl show -p ActiveEnterTimestamp --value "$svc" 2>/dev/null || true)
+    [[ -n "$stamp" ]] || return 0
+    date -d "$stamp" +%s 2>/dev/null || true
+}
+
+# Checkout SHA, deployed SHA, and whether the running services predate the
+# commit they are supposed to be running. Read-only; safe to call before or
+# after a deploy, and on its own through --status.
+deploy_status() {
+    local head_sha deployed commit_time started started_human svc drift=0
+
+    head_sha=$(as_app git -C "$APP_DIR" rev-parse HEAD 2>/dev/null || echo unknown)
+    deployed=$(deployed_sha)
+
+    info "checkout  ${head_sha:0:7}  $(as_app git -C "$APP_DIR" log -1 --format=%cd --date=iso-strict 2>/dev/null || true)"
+    if [[ -z "$deployed" ]]; then
+        info "deployed  unknown   ($DEPLOYED_SHA_FILE missing)"
+    else
+        info "deployed  ${deployed:0:7}  $DEPLOYED_SHA_FILE"
+        [[ "$deployed" != "$head_sha" ]] && drift=1
+    fi
+
+    # The commit the services are supposed to be running. A service that started
+    # before that commit was made cannot be running it, whatever the SHA says.
+    commit_time=""
+    if [[ -n "$deployed" ]]; then
+        commit_time=$(as_app git -C "$APP_DIR" show -s --format=%ct "$deployed" 2>/dev/null || true)
+    fi
+
+    for svc in "${SERVICES[@]}"; do
+        [[ -f "$SYSTEMD_DIR/$svc.service" ]] || continue
+        started=$(service_started_at "$svc")
+        if [[ -z "$started" ]]; then
+            info "$svc  not running"
+            continue
+        fi
+        started_human=$(date -d "@$started" +'%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo "$started")
+        info "$svc  started $started_human"
+        if [[ -n "$commit_time" ]] && (( started < commit_time )); then
+            info "  WARNING: started before ${deployed:0:7} was committed, so it is running older code"
+            drift=1
+        fi
+    done
+
+    if [[ -n "$deployed" && "$deployed" != "$head_sha" ]]; then
+        info "  WARNING: the checkout is ahead of what was deployed; run a deploy"
+    fi
+    return "$drift"
+}
+
+if (( STATUS_ONLY )); then
+    say "Deployment status"
+    info "$CTX"
+    status_rc=0
+    deploy_status || status_rc=$?
+    if (( status_rc )); then
+        printf '\nStale: what is running does not match the checkout\n'
+    else
+        printf '\nCurrent\n'
+    fi
+    # Non-zero on drift, so this is usable from a cron check or a health probe
+    # rather than only by eye.
+    exit "$status_rc"
+fi
+
 # Whether the mirror step can run at all.
 mirror_available() {
     (( ! NO_MIRROR )) && [[ -x "$VENV/bin/locatron" ]]
@@ -373,23 +504,41 @@ as_app git -C "$APP_DIR" reset --hard --quiet "origin/$BRANCH"
 
 NEW_SHA=$(as_app git -C "$APP_DIR" rev-parse HEAD)
 
+DEPLOYED_SHA=$(deployed_sha)
+
+# The shortcut. Three things have to agree before this run may do nothing:
+# origin, the checkout, and what was last actually deployed -- plus a current
+# mirror. Two of those used to be one check.
 if [[ "$OLD_SHA" == "$NEW_SHA" ]] && (( ! FORCE )); then
-    # No new commit does not mean nothing to do. The mirror tracks
-    # locatron_street, which is rebuilt in MySQL on its own schedule, so it goes
-    # stale with no commit involved. Exiting here unconditionally left the
-    # workers on an out-of-date gazetteer and said "nothing to do".
-    if ! mirror_available; then
-        info "already at ${NEW_SHA:0:7}, nothing to do (use --force to redeploy)"
+    if [[ -z "$DEPLOYED_SHA" ]]; then
+        # No record at all. Either this is the first deploy since the record was
+        # introduced, or a deploy failed before it could be written. Neither is
+        # evidence that the services are running this commit.
+        info "already at ${NEW_SHA:0:7}, but there is no record of a completed deploy"
+        info "($DEPLOYED_SHA_FILE missing) - continuing rather than assuming"
+    elif [[ "$DEPLOYED_SHA" != "$NEW_SHA" ]]; then
+        # This is the case that left production a day behind: an earlier run
+        # fetched this commit, then failed somewhere before the restart, so the
+        # checkout matched origin while the services did not.
+        info "already at ${NEW_SHA:0:7}, but the last completed deploy was ${DEPLOYED_SHA:0:7}"
+        info "continuing: the commit was fetched but never restarted into service"
+    elif ! mirror_available; then
+        info "already at ${NEW_SHA:0:7} and deployed, nothing to do (use --force to redeploy)"
         exit 0
-    fi
-    mirror_resolve
-    if mirror_needs_build; then
-        info "already at ${NEW_SHA:0:7}, but the street mirror is $MIRROR_REASON"
-        info "continuing: rebuild it, then restart so the workers pick it up"
     else
-        info "already at ${NEW_SHA:0:7} and the mirror is current, nothing to do"
-        info "(use --force to redeploy anyway)"
-        exit 0
+        # No new commit does not mean nothing to do. The mirror tracks
+        # locatron_street, which is rebuilt in MySQL on its own schedule, so it
+        # goes stale with no commit involved. Exiting here unconditionally left
+        # the workers on an out-of-date gazetteer and said "nothing to do".
+        mirror_resolve
+        if mirror_needs_build; then
+            info "already at ${NEW_SHA:0:7} and deployed, but the street mirror is $MIRROR_REASON"
+            info "continuing: rebuild it, then restart so the workers pick it up"
+        else
+            info "already at ${NEW_SHA:0:7}, deployed, and the mirror is current, nothing to do"
+            info "(use --force to redeploy anyway)"
+            exit 0
+        fi
     fi
 fi
 
@@ -498,8 +647,11 @@ fi
 say "Restarting services"
 
 RESTARTED=0
-for svc in locatron-api locatron-bulk; do
-    unit="/etc/systemd/system/$svc.service"
+for svc in "${SERVICES[@]}"; do
+    # $SYSTEMD_DIR, not a hardcoded /etc/systemd/system: install_units writes
+    # there and the verification loop below reads there, so restarting from a
+    # different path would have restarted a unit nobody installed.
+    unit="$SYSTEMD_DIR/$svc.service"
     module="$APP_DIR/locatron/${svc#locatron-}/app.py"
 
     if [[ ! -f "$unit" ]]; then
@@ -518,19 +670,40 @@ done
 
 if (( RESTARTED )); then
     sleep 2
-    for svc in locatron-api locatron-bulk; do
-        [[ -f "/etc/systemd/system/$svc.service" ]] || continue
+    for svc in "${SERVICES[@]}"; do
+        [[ -f "$SYSTEMD_DIR/$svc.service" ]] || continue
         state=$($SUDO systemctl is-active "$svc" 2>/dev/null || true)
         [[ "$state" == "inactive" ]] && continue
         info "$svc is $state"
         if [[ "$state" != "active" ]]; then
-            $SUDO journalctl -u "$svc" -n 20 --no-pager | sed 's/^/      /'
+            # `|| true`: under pipefail a journalctl that is missing or fails
+            # would abort the script here, losing the die message below -- which
+            # is the only line that says what actually went wrong.
+            $SUDO journalctl -u "$svc" -n 20 --no-pager 2>&1 | sed 's/^/      /' || true
             die "$svc did not come up. Previous commit was ${OLD_SHA:0:7}"
         fi
     done
 fi
 
 # ---------------------------------------------------------------------------
+#
+# Only now, with the services verified up, is this commit deployed. Written
+# after the health check rather than after the restart command, because a unit
+# that restarts and then dies has not deployed anything.
+
+if (( RESTARTED )); then
+    record_deployed_sha "$NEW_SHA"
+    info "recorded ${NEW_SHA:0:7} in $DEPLOYED_SHA_FILE"
+else
+    # Nothing to restart means nothing took this code into service, so the record
+    # is left alone and the next run will not take the shortcut. Safe, and honest.
+    info "no services restarted, so $DEPLOYED_SHA_FILE was not updated"
+fi
+
+# ---------------------------------------------------------------------------
+
+say "Deployment status"
+deploy_status || true
 
 printf '\nDeployed %s\n' "${NEW_SHA:0:7}"
 printf 'Previous %s\n' "${OLD_SHA:0:7}"
