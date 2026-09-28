@@ -1,0 +1,42 @@
+# Python bytecode and build artifacts.
+# *.py[cod] covers .pyc, .pyo and .pyd. Note that .gitignore has no inline
+# comment syntax: a trailing "# ..." becomes part of the pattern and silently
+# matches nothing.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+# ...but locatron/build/ is a package, not an artifact. locatron-build.service
+# already points at `python -m locatron.build.refresh`.
+!locatron/build/
+dist/
+
+# Virtualenv
+.venv/
+
+# Secrets. .env.example is a tracked template; real env files never are.
+.env
+.env.*
+!.env.example
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors
+.idea/
+.vscode/
+
+# The SQLite street mirror. Built from locatron_street by
+# `locatron build streets`, 54.6 MB, and reproducible from the database.
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+data/
+
+# Scratch parser reports from `locatron parse`, kept out of the repo.
+phase2-report-*.md

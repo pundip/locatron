@@ -1,7 +1,16 @@
 """The response envelope.
 
 One schema covers both the loose-place path and the AU address path, so
-consumers never have to branch on which resolver ran.
+consumers never have to branch on which resolver ran. A world answer carries the
+same keys an Australian one does, with nulls where there is nothing to report.
+
+`au_address` is the **full G-NAF record** -- every column of the matched
+`address_ref` row, not a summary of it. There is deliberately no separate `gnaf`
+key: `au_address` is that object, and a second top-level key holding the same
+contents would put two sources of truth in one envelope. `tests/test_schemas.py`
+asserts the correspondence against `parse.lookup.GnafRecord` in both directions,
+so a column added by an upstream refresh fails loudly rather than quietly not
+being forwarded.
 
 Resolution never raises for unresolvable input. An unresolvable string comes
 back as HTTP 200 with granularity=UNRESOLVED and confidence=0.0.
@@ -10,12 +19,12 @@ back as HTTP 200 with granularity=UNRESOLVED and confidence=0.0.
 from __future__ import annotations
 
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class Granularity(str, Enum):
+class Granularity(StrEnum):
     """Ordered from most to least specific."""
 
     UNIT = "unit"
@@ -37,7 +46,7 @@ def at_least(got: Granularity, want: Granularity) -> bool:
     return _ORDER.index(got) <= _ORDER.index(want)
 
 
-class MatchMethod(str, Enum):
+class MatchMethod(StrEnum):
     CACHE = "cache"
     GNAF_EXACT = "gnaf_exact"
     GNAF_STREET_CENTROID = "gnaf_street_centroid"
@@ -53,7 +62,7 @@ class MatchMethod(str, Enum):
     NONE = "none"
 
 
-class GeoSource(str, Enum):
+class GeoSource(StrEnum):
     GNAF_PROPERTY_CENTROID = "gnaf_property_centroid"
     GNAF_STREET_CENTROID = "gnaf_street_centroid"
     LOCALITY_CENTROID = "locality_centroid"
@@ -82,7 +91,16 @@ class Geo(BaseModel):
 
 
 class AuAddress(BaseModel):
-    """G-NAF fields. Populated only for granularity unit/address/street."""
+    """Every G-NAF column from the matched `address_ref` row.
+
+    Populated for granularity unit and address, where a row was actually
+    matched. Empty for street and below: those answers come from precomputed
+    centroids and there is no single row behind them.
+
+    Blank strings from G-NAF arrive here as None, because a consumer checking
+    `if flat_number` should not have to know that address_ref uses '' for
+    absent.
+    """
 
     address_detail_pid: str | None = None
     flat_type: str | None = None
@@ -91,22 +109,56 @@ class AuAddress(BaseModel):
     level_number: str | None = None
     number_first: str | None = None
     number_last: str | None = None
+    lot_number: str | None = None
     street_name: str | None = None
     street_type: str | None = None
     street_suffix: str | None = None
     locality_name: str | None = None
     state: str | None = None
     postcode: str | None = None
+    building_name: str | None = None
+    address_site_name: str | None = None
     mb_code: str | None = None
-    alias_principal: str | None = None
-    primary_secondary: str | None = None
+    legal_parcel_id: str | None = None
+    geocode_type: str | None = Field(
+        None, description="How G-NAF sited the point, e.g. 'PROPERTY CENTROID'"
+    )
+    alias_principal: str | None = Field(
+        None, description="'P' for a principal row, 'A' for an alias of one"
+    )
+    principal_pid: str | None = Field(
+        None, description="Set on an alias row: the pid it is an alias of"
+    )
+    primary_secondary: str | None = Field(
+        None, description="'P' group head, 'S' member, None for an ordinary address"
+    )
+    primary_pid: str | None = None
+    date_created: str | None = None
     formatted: str | None = Field(
-        None, description="Single-line canonical form, e.g. '65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201'"
+        None,
+        description=("G-NAF's own ADDRESS_LABEL, e.g. '65 CLIFTON PARK DR, CARRUM DOWNS VIC 3201'"),
     )
 
 
+class Principal(BaseModel):
+    """The principal address an alias match belongs to.
+
+    Set only when the matched row is a G-NAF alias. The match itself stays the
+    alias -- it carries the street and number the input used -- and this is the
+    row to join and deduplicate on. See `canonical_pid`.
+    """
+
+    pid: str
+    formatted: str = Field(description="The principal's own ADDRESS_LABEL")
+
+
 class Candidate(BaseModel):
-    """A runner-up. Populated when the match was ambiguous."""
+    """A runner-up. Populated when the match was ambiguous.
+
+    For a bare postcode this is where the localities it could mean go: the input
+    proved the postcode and nothing narrower, so they are alternates rather than
+    an answer.
+    """
 
     label: str
     confidence: float
@@ -114,6 +166,14 @@ class Candidate(BaseModel):
     country: str | None = None
     admin1: str | None = None
     locality: str | None = None
+    postcode: str | None = None
+    score: float | None = Field(
+        None,
+        description=(
+            "The raw joint score, before mapping onto 0..1. Exposed so a caller "
+            "can see the margin over the winner, which confidence only summarises."
+        ),
+    )
     reason: str | None = None
 
 
@@ -127,6 +187,15 @@ class ResolveRequest(BaseModel):
     use_cache: bool = True
 
 
+class Route(StrEnum):
+    """Which resolver answered."""
+
+    AU = "au"
+    """The Australian address path: parsed into locality, street, number, unit."""
+    WORLD = "world"
+    """The loose place path: matched against cities, countries and buckets."""
+
+
 class ResolveResponse(BaseModel):
     query: str
     normalized: str
@@ -134,6 +203,14 @@ class ResolveResponse(BaseModel):
     granularity: Granularity
     confidence: float = Field(ge=0.0, le=1.0)
     match_method: MatchMethod
+    route: Route | None = Field(
+        None,
+        description=(
+            "Which resolver produced this answer. None for an empty input or an "
+            "internal failure, where routing never happened. `match_method` cannot "
+            "stand in for it: both paths use locality_exact and postal_only."
+        ),
+    )
 
     country: Country | None = None
     admin1: Admin1 | None = None
@@ -141,6 +218,15 @@ class ResolveResponse(BaseModel):
     postcode: str | None = None
     geo: Geo | None = None
     au_address: AuAddress | None = None
+    canonical_pid: str | None = Field(
+        None,
+        description=(
+            "The G-NAF pid to join and deduplicate on: the principal's pid when "
+            "the match is an alias, the matched row's own pid otherwise. None "
+            "below address granularity, where no single row was matched."
+        ),
+    )
+    principal: Principal | None = None
 
     candidates: list[Candidate] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)

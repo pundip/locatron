@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: refuse to commit credentials.
+#
+# Versioned in the repo rather than living in .git/hooks, so it survives a
+# fresh clone and applies to every commit path -- including commits made by
+# Claude Code, which never sees PyCharm's UI settings.
+#
+# Enable once per clone:
+#     git config core.hooksPath scripts/git-hooks
+#
+# Bypass deliberately (rarely correct):
+#     git commit --no-verify
+
+set -uo pipefail
+
+C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_RESET=$'\033[0m'
+FAILED=0
+
+staged() { git diff --cached --name-only --diff-filter=ACM; }
+
+fail() {
+    printf '%sBLOCKED  %s%s\n' "$C_RED" "$1" "$C_RESET" >&2
+    FAILED=1
+}
+
+# ---------------------------------------------------------------------------
+# 1. Filenames that should never be committed.
+#
+# .gitignore normally stops these, but `git add -f` bypasses it and so does a
+# file that was committed before the ignore rule existed.
+# ---------------------------------------------------------------------------
+
+while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    base=$(basename "$file")
+
+    case "$base" in
+        .env.example) ;;
+        .env|.env.*)          fail "$file — environment file" ;;
+        *.pem|*.key|*.p12|*.pfx) fail "$file — private key material" ;;
+        id_rsa|id_ed25519)    fail "$file — SSH private key" ;;
+        .my.cnf)              fail "$file — MySQL credential file" ;;
+        dataSources.local.xml) fail "$file — PyCharm database passwords" ;;
+    esac
+
+    case "$file" in
+        .idea/*) fail "$file — PyCharm project settings, may contain credentials" ;;
+    esac
+done < <(staged)
+
+# ---------------------------------------------------------------------------
+# 2. Secret-looking content in staged changes.
+#
+# Placeholders are allowed so that .env.example, grants.sql, and nginx.conf
+# can carry CHANGE_ME / REPLACE_ME / empty values without tripping this.
+# ---------------------------------------------------------------------------
+
+PLACEHOLDER='CHANGE_ME|REPLACE_ME|YOUR_|xxx+|\.\.\.|<[a-z_]+>|\$\{|example|placeholder|dummy'
+
+while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    [[ "$file" == *".env.example" ]] && continue
+    # This hook's own source contains the patterns it searches for.
+    [[ "$file" == "scripts/git-hooks/"* ]] && continue
+    [[ -f "$file" ]] || continue
+
+    # Only added lines, and only the content after the leading '+'.
+    added=$(git diff --cached -U0 -- "$file" | grep '^+' | grep -v '^+++' | cut -c2-)
+    [[ -z "$added" ]] && continue
+
+    while IFS= read -r line; do
+        # Assignment of a non-trivial value to a secret-ish name.
+        if printf '%s' "$line" | grep -qiE \
+            '(password|passwd|secret|api[_-]?key|token|private[_-]?key)[[:space:]]*[=:][[:space:]]*["'"'"']?[^"'"'"'[:space:]]{8,}'; then
+            printf '%s' "$line" | grep -qiE "$PLACEHOLDER" && continue
+            fail "$file — possible secret: $(printf '%s' "$line" | cut -c1-70)"
+        fi
+
+        # Well-known key shapes.
+        if printf '%s' "$line" | grep -qE \
+            '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|sk-[A-Za-z0-9]{32,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'; then
+            fail "$file — credential pattern on an added line"
+        fi
+    done <<< "$added"
+done < <(staged)
+
+# ---------------------------------------------------------------------------
+# 3. Project-specific invariant.
+#
+# CLAUDE.md: changing normalize() requires a NORM_VERSION bump and a full
+# database rebuild. A silent change is the drift failure the whole project is
+# built to avoid, so warn loudly. Not a hard block -- comments and helpers in
+# that file change legitimately.
+# ---------------------------------------------------------------------------
+
+if staged | grep -q '^locatron/normalize\.py$'; then
+    if git diff --cached -- locatron/normalize.py | grep -qE '^[+-].*def normalize|^[+-]\s*s = |^[+-]_PUNCT|^[+-]_SPACE|^[+-]_DASH'; then
+        if ! git diff --cached -- locatron/normalize.py | grep -q '^+NORM_VERSION'; then
+            printf '%sWARNING  normalize() changed without a NORM_VERSION bump.%s\n' \
+                "$C_YELLOW" "$C_RESET" >&2
+            printf '         Every norm_key in the database was built with the old version.\n' >&2
+            printf '         See CLAUDE.md. Continue only if you know this is safe.\n\n' >&2
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+
+if (( FAILED )); then
+    printf '\n%sCommit blocked. Unstage the files above, or --no-verify if you are certain.%s\n\n' \
+        "$C_RED" "$C_RESET" >&2
+    exit 1
+fi
+
+exit 0

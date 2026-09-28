@@ -406,8 +406,17 @@ DROP TABLE IF EXISTS _ll_auspost;
 
 
 -- =============================================================================
--- NEXT: run normalize_pass.py to populate norm_key and alias_norm_key.
--- Until that runs, every ix_ll_norm lookup returns nothing.
+-- NEXT: run normalize_pass.py to populate norm_key and alias_norm_key,
+-- then dedupe_locality.py. Until the first runs, every ix_ll_norm lookup
+-- returns nothing.
+--
+-- dedupe_locality.py collapses localities that differ only in punctuation.
+-- The unique index below is on the raw locality, so G-NAF's D'AGUILAR (0x27)
+-- and AusPost's D’AGUILAR (U+2019) are two rows here and one place after
+-- normalisation. 16 groups are affected; nine are that apostrophe, three are
+-- 'NO. 4 BRANCH' against 'NO 4 BRANCH', and four are the same pair repeated
+-- in a second state.
+-- Do not try to fold that here: normalisation belongs in normalize.py alone.
 --
 -- ON REBUILDS: Step 1 drops both tables, which takes your manual aliases with
 -- them. Export first:

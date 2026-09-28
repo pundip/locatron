@@ -10,16 +10,18 @@ User=locatron
 Group=locatron
 WorkingDirectory=/opt/locatron/app
 EnvironmentFile=/opt/locatron/.env
+Environment=HOME=/var/lib/locatron
 ExecStart=/opt/locatron/venv/bin/gunicorn locatron.api.app:app \
+    -c /opt/locatron/app/deploy/gunicorn.conf.py \
     --worker-class uvicorn.workers.UvicornWorker \
     --workers 4 \
     --bind 127.0.0.1:8080 \
+    --forwarded-allow-ips="127.0.0.1" \
     --timeout 30 \
     --graceful-timeout 30 \
     --keep-alive 5 \
     --max-requests 10000 \
     --max-requests-jitter 1000 \
-    --access-logfile - \
     --error-logfile -
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always
